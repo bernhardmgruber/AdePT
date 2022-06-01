@@ -136,7 +136,7 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
     auto &&track = generator.NextTrack();
 
     ranlux::SetSeed(track(RngState{}), startEvent + i);
-    track(Energy{})       = energy;
+    track(Energy{})                             = energy;
     track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
     track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
     track(NumIALeft{}, llama::RecordCoord<2>{}) = -1.0;
@@ -145,10 +145,12 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
     track(DynamicRangeFactor{}) = -1.0;
     track(TlimitMin{})          = -1.0;
 
-    track(Pos{}) = {vecgeom::Precision(startX), 0, 0};
-    track(Dir{}) = {1.0, 0, 0};
-    track(NavState{}).Clear();
-    BVHNavigator::LocatePointIn(world, track(Pos{}), track(NavState{}), true);
+    track(Pos{})  = {vecgeom::Precision(startX), 0, 0};
+    track(Dir{})  = {1.0, 0, 0};
+    auto navState = decayCopy(track(NavState{}));
+    navState.Clear();
+    BVHNavigator::LocatePointIn(world, track(Pos{}), navState, true);
+    track(NavState{}) = navState;
 
     atomicAdd(&globalScoring->numElectrons, 1);
   }
@@ -174,12 +176,16 @@ __global__ void ClearQueue(adept::MParray *queue)
 }
 
 template <typename View>
-void reportHits(View tracks, cudaStream_t stream) {
+void reportHits(int iteration, std::string_view kernelName, View tracks, cudaStream_t stream)
+{
   if constexpr (llama::mapping::isTrace<typename View::Mapping>) {
     std::byte *hitsArrayBlob = tracks.storageBlobs.back();
     typename View::Mapping::FieldHitsArray hits;
+    // TODO(bgruber): we can improve this by using cudaMemsetAsync and print inside cudaLaunchHostFunc
     COPCORE_CUDA_CHECK(cudaMemcpy(&hits, hitsArrayBlob, sizeof(hits), cudaMemcpyDeviceToHost));
+    std::cout << "Iteration " << iteration << ' ' << kernelName << '\n';
     tracks.mapping().printFieldHits(hits);
+    std::cout << '\n';
     COPCORE_CUDA_CHECK(cudaMemsetAsync(hitsArrayBlob, 0, sizeof(hits), stream));
   }
 }
@@ -300,7 +306,7 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
   }
 
   unsigned long long killed = 0;
-
+  int iteration             = 0;
   for (int startEvent = 1; startEvent <= numParticles; startEvent += batch) {
     if (detailed) {
       std::cout << startEvent << " ... " << std::flush;
@@ -349,6 +355,7 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
         TransportElectrons<<<transportBlocks, TransportThreads, 0, electrons.stream>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
             scoringPerVolume);
+        reportHits(iteration, "TransportElectrons", electrons.tracks, electrons.stream);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(electrons.event, electrons.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(stream, electrons.event, 0));
@@ -363,6 +370,7 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
         TransportPositrons<<<transportBlocks, TransportThreads, 0, positrons.stream>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume);
+        reportHits(iteration, "TransportPositrons", positrons.tracks, positrons.stream);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(positrons.event, positrons.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(stream, positrons.event, 0));
@@ -377,6 +385,7 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
         TransportGammas<<<transportBlocks, TransportThreads, 0, gammas.stream>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume);
+        reportHits(iteration, "TransportGammas", gammas.tracks, gammas.stream);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(gammas.event, gammas.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(stream, gammas.event, 0));
@@ -392,7 +401,6 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
 
       // Finally synchronize all kernels.
       COPCORE_CUDA_CHECK(cudaStreamSynchronize(stream));
-      reportHits(electrons.tracks, stream);
 
       // Count the number of particles in flight.
       inFlight = 0;
@@ -417,6 +425,7 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
         loopingNo         = 0;
       }
 
+      iteration++;
     } while (inFlight > 0 && loopingNo < 200);
 
     if (inFlight > 0) {

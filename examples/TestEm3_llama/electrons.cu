@@ -42,10 +42,10 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot       = (*active)[i];
     auto &&currentTrack  = electrons[slot];
-    auto energy          = currentTrack(Energy{});
-    auto pos             = currentTrack(Pos{});
-    auto dir             = currentTrack(Dir{});
-    auto navState        = currentTrack(NavState{});
+    auto energy          = decayCopy(currentTrack(Energy{}));
+    auto pos             = decayCopy(currentTrack(Pos{}));
+    auto dir             = decayCopy(currentTrack(Dir{}));
+    auto navState        = decayCopy(currentTrack(NavState{}));
     const int volumeID   = navState.Top()->id();
     const int theMCIndex = MCIndex[volumeID];
 
@@ -212,13 +212,13 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
         ranlux::Advance(newRNG);
         gamma1(RngState{}) = newRNG;
         gamma1(Energy{})   = copcore::units::kElectronMassC2;
-        gamma1(Dir{}).Set(sint * cosPhi, sint * sinPhi, cost);
+        gamma1(Dir{})      = Vec3(sint * cosPhi, sint * sinPhi, cost);
 
         InitAsSecondary(gamma2, pos, navState);
         // Reuse the RNG state of the dying track.
-        gamma2(RngState{}) = currentTrack(RngState{});
+        gamma2(RngState{}) = rngRef;
         gamma2(Energy{})   = copcore::units::kElectronMassC2;
-        gamma2(Dir{})      = -gamma1(Dir{});
+        gamma2(Dir{})      = -decayCopy(gamma1(Dir{}));
       }
       // Particles are killed by not enqueuing them into the new activeQueue.
       continue;
@@ -286,7 +286,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
       InitAsSecondary(secondary, pos, navState);
       secondary(RngState{}) = newRNG;
       secondary(Energy{})   = deltaEkin;
-      secondary(Dir{}).Set(dirSecondary[0], dirSecondary[1], dirSecondary[2]);
+      secondary(Dir{})      = Vec3(dirSecondary[0], dirSecondary[1], dirSecondary[2]);
 
       energy -= deltaEkin;
       dir.Set(dirPrimary[0], dirPrimary[1], dirPrimary[2]);
@@ -312,7 +312,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
       InitAsSecondary(gamma, pos, navState);
       gamma(RngState{}) = newRNG;
       gamma(Energy{})   = deltaEkin;
-      gamma(Dir{}).Set(dirSecondary[0], dirSecondary[1], dirSecondary[2]);
+      gamma(Dir{})      = Vec3(dirSecondary[0], dirSecondary[1], dirSecondary[2]);
 
       energy -= deltaEkin;
       dir.Set(dirPrimary[0], dirPrimary[1], dirPrimary[2]);
@@ -334,13 +334,13 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
       InitAsSecondary(gamma1, pos, navState);
       gamma1(RngState{}) = newRNG;
       gamma1(Energy{})   = theGamma1Ekin;
-      gamma1(Dir{}).Set(theGamma1Dir[0], theGamma1Dir[1], theGamma1Dir[2]);
+      gamma1(Dir{})      = Vec3(theGamma1Dir[0], theGamma1Dir[1], theGamma1Dir[2]);
 
       InitAsSecondary(gamma2, pos, navState);
       // Reuse the RNG state of the dying track.
-      gamma2(RngState{}) = currentTrack(RngState{});
+      gamma2(RngState{}) = rngRef;
       gamma2(Energy{})   = theGamma2Ekin;
-      gamma2(Dir{}).Set(theGamma2Dir[0], theGamma2Dir[1], theGamma2Dir[2]);
+      gamma2(Dir{})      = Vec3(theGamma2Dir[0], theGamma2Dir[1], theGamma2Dir[2]);
 
       // The current track is killed by not enqueuing into the next activeQueue.
       break;

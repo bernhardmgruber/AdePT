@@ -27,10 +27,10 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot       = (*active)[i];
     auto &&currentTrack  = gammas[slot];
-    auto energy          = currentTrack(Energy{});
-    auto pos             = currentTrack(Pos{});
-    auto dir             = currentTrack(Dir{});
-    auto navState        = currentTrack(NavState{});
+    auto energy          = decayCopy(currentTrack(Energy{}));
+    auto pos             = decayCopy(currentTrack(Pos{}));
+    auto dir             = decayCopy(currentTrack(Dir{}));
+    auto navState        = decayCopy(currentTrack(NavState{}));
     const int volumeID   = navState.Top()->id();
     const int theMCIndex = MCIndex[volumeID];
 
@@ -150,13 +150,13 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
       InitAsSecondary(electron, pos, navState);
       electron(RngState{}) = newRNG;
       electron(Energy{})   = elKinEnergy;
-      electron(Dir{}).Set(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
+      electron(Dir{})      = Vec3(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
 
       InitAsSecondary(positron, pos, navState);
       // Reuse the RNG state of the dying track.
-      positron(RngState{}) = currentTrack(RngState{});
+      positron(RngState{}) = rngRef;
       positron(Energy{})   = posKinEnergy;
-      positron(Dir{}).Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
+      positron(Dir{})      = Vec3(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
 
       // The current track is killed by not enqueuing into the next activeQueue.
       break;
@@ -183,8 +183,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
         InitAsSecondary(electron, pos, navState);
         electron(RngState{}) = newRNG;
         electron(Energy{})   = energyEl;
-        electron(Dir{})      = energy * dir - newEnergyGamma * newDirGamma;
-        electron(Dir{}).Normalize();
+        electron(Dir{})      = (energy * dir - newEnergyGamma * newDirGamma).Normalized();
       } else {
         atomicAdd(&globalScoring->energyDeposit, energyEl);
         atomicAdd(&scoringPerVolume->energyDeposit[volumeID], energyEl);
@@ -223,7 +222,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
         InitAsSecondary(electron, pos, navState);
         electron(RngState{}) = newRNG;
         electron(Energy{})   = photoElecE;
-        electron(Dir{}).Set(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
+        electron(Dir{})      = Vec3(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
       } else {
         edep = energy;
       }

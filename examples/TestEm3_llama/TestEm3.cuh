@@ -13,6 +13,8 @@
 #include <VecGeom/navigation/NavStateIndex.h>
 #include <cmath>
 
+using Vec3 = vecgeom::Vector3D<vecgeom::Precision>;
+
 struct State {};
 struct Carry {};
 struct BitPos {};
@@ -33,21 +35,32 @@ using RanluxDbl = llama::Record<llama::Field<State, llama::Array<uint64_t, 9>>, 
 using Track =
     llama::Record<llama::Field<RngState, RanluxDbl>, llama::Field<Energy, double>, llama::Field<NumIALeft, double[3]>,
                   llama::Field<InitialRange, double>, llama::Field<DynamicRangeFactor, double>,
-                  llama::Field<TlimitMin, double>, llama::Field<Pos, vecgeom::Vector3D<vecgeom::Precision>>,
-                  llama::Field<Dir, vecgeom::Vector3D<vecgeom::Precision>>,
+                  llama::Field<TlimitMin, double>, llama::Field<Pos, Vec3>, llama::Field<Dir, Vec3>,
                   llama::Field<NavState, vecgeom::NavStateIndex>>;
 
-using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>;
-// using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-// using Mapping  = llama::mapping::AlignedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-//  using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 16>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 32>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 64>;
-//  using Mapping  = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>, unsigned long
-//  long, true>;
+// using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>;
+//  using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
+//  using Mapping  = llama::mapping::AlignedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
+//   using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
+//   using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 16>;
+//   using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 32>;
+//   using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 64>;
+using Mapping =
+    llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>, unsigned long long, true>;
 using BlobType = std::byte *;
 using View     = llama::View<Mapping, BlobType>;
+
+template <typename T, std::enable_if_t<llama::isProxyReference<T>, int> = 0>
+__host__ __device__ auto decayCopy(T t) -> typename T::value_type
+{
+  return t;
+}
+
+template <typename T>
+__host__ __device__ auto decayCopy(T &t) -> T
+{
+  return t;
+}
 
 // we are providing the engine now :D
 #define G4HepEmRandomEngine_HH
@@ -65,8 +78,9 @@ inline constexpr int kMaxPos        = 9 * 64;
 template <typename VR>
 __host__ __device__ void SaveState(VR &&vr, uint64_t *state)
 {
+  const auto vrState = decayCopy(vr(State{}));
   for (int i = 0; i < 9; i++) {
-    state[i] = vr(State{})[i];
+    state[i] = vrState[i];
   }
   //  boost::mp11::mp_for_each<boost::mp11::mp_iota_c<9>>([&](auto ic) {
   //    constexpr auto i = decltype(ic)::value;
@@ -77,9 +91,11 @@ __host__ __device__ void SaveState(VR &&vr, uint64_t *state)
 template <typename VR>
 __host__ __device__ void LoadState(VR &&vr, const uint64_t *state)
 {
+  llama::Array<uint64_t, 9> vrState;
   for (int i = 0; i < 9; i++) {
-    vr(State{})[i] = state[i];
+    vrState[i] = state[i];
   }
+  vr(State{}) = vrState;
   //  boost::mp11::mp_for_each<boost::mp11::mp_iota_c<9>>([&](auto ic) {
   //    constexpr auto i                     = decltype(ic)::value;
   //    vr(State{}, llama::RecordCoord<i>{}) = state[i];
@@ -102,13 +118,16 @@ __host__ __device__ void XORstate(VR &&vr, const uint64_t *state)
 template <typename VR>
 __host__ __device__ void Advance(VR &&vr)
 {
-  uint64_t lcg[9];
-  //  uint64_t state[9];
+  auto state = decayCopy(vr(State{}));
+  auto carry = decayCopy(vr(Carry{}));
   //  SaveState(vr, state);
-  to_lcg(vr(State{}).begin(), vr(Carry{}), lcg);
+  uint64_t lcg[9];
+  to_lcg(state.begin(), vr(Carry{}), lcg);
   mulmod(kA, lcg);
-  to_ranlux(lcg, vr(State{}).begin(), vr(Carry{}));
+  to_ranlux(lcg, state.begin(), carry);
   //  LoadState(vr, state);
+  vr(State{})  = state;
+  vr(Carry{})  = carry;
   vr(BitPos{}) = 0;
 }
 
@@ -126,9 +145,10 @@ __host__ __device__ uint64_t NextRandomBits(VR &&vr)
   int offset  = position % 64;
   int numBits = 64 - offset;
 
-  uint64_t bits = vr(State{})[idx] >> offset;
+  const auto state = decayCopy(vr(State{}));
+  uint64_t bits    = state[idx] >> offset;
   if (numBits < w) {
-    bits |= vr(State{})[idx + 1] << numBits;
+    bits |= state[idx + 1] << numBits;
   }
   //  uint64_t bits;
   //  boost::mp11::mp_with_index<9>(idx, [&](auto ic) {
@@ -178,8 +198,11 @@ __host__ __device__ void SetSeed(VR &&vr, uint64_t s)
   powermod(a_seed, a_seed, s);
   mulmod(a_seed, lcg);
 
-  //  uint64_t state[9];
-  to_ranlux(lcg, vr(State{}).begin(), vr(Carry{}));
+  llama::Array<uint64_t, 9> state;
+  unsigned carry;
+  to_ranlux(lcg, state.begin(), carry);
+  vr(State{}) = state;
+  vr(Carry{}) = carry;
   //  LoadState(vr, state);
   vr(BitPos{}) = 0;
 }
@@ -217,7 +240,7 @@ struct G4HepEmRandomEngine {
   // bgruber: avoiding inlining here makes the code actually faster
   __noinline__ G4HepEmHostDevice double flat() { return ranlux::NextRandomFloat(recordRef); }
 
-    // bgruber: avoiding inlining here makes the code actually faster
+  // bgruber: avoiding inlining here makes the code actually faster
   __noinline__ G4HepEmHostDevice void flatArray(const int size, double *vect)
   {
     for (int i = 0; i < size; i++) {
