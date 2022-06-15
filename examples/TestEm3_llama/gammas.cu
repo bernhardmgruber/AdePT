@@ -40,11 +40,13 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     theTrack->SetEKin(currentTrack(Energy{}));
     theTrack->SetMCIndex(theMCIndex);
 
+    RanluxppDoubleLlama rngRef{currentTrack(RngState{})}; // reference to RNG in memory
+
     // Sample the `number-of-interaction-left` and put it into the track.
     for (int ip = 0; ip < 3; ++ip) {
       double &numIALeft = currentTrack(NumIALeft{})[ip];
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        numIALeft = -std::log(rngRef.Rndm());
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     }
@@ -107,9 +109,9 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     currentTrack(NumIALeft{})[winnerProcessIndex] = -1.0;
 
     // Perform the discrete interaction.
-    RanluxppDoubleEngine rnge(&currentTrack(RngState{}));
+    RanluxppDoubleEngineLlama rnge(&rngRef);
     // We might need one branched RNG state, prepare while threads are synchronized.
-    RanluxppDouble newRNG(currentTrack(RngState{}).Branch());
+    auto newRNG = rngRef.Branch();
 
     const double energy = currentTrack(Energy{});
 
@@ -137,13 +139,13 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
       atomicAdd(&globalScoring->numPositrons, 1);
 
       InitAsSecondary(electron, /*parent=*/currentTrack);
-      electron(RngState{}) = newRNG;
+      electron(RngState{}) = newRNG.vr;
       electron(Energy{})   = elKinEnergy;
       electron(Dir{}).Set(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
 
       InitAsSecondary(positron, /*parent=*/currentTrack);
       // Reuse the RNG state of the dying track.
-      positron(RngState{}) = currentTrack(RngState{});
+      positron(RngState{}) = rngRef.vr;
       positron(Energy{})   = posKinEnergy;
       positron(Dir{}).Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
 
@@ -170,7 +172,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
         atomicAdd(&globalScoring->numElectrons, 1);
 
         InitAsSecondary(electron, /*parent=*/currentTrack);
-        electron(RngState{}) = newRNG;
+        electron(RngState{}) = newRNG.vr;
         electron(Energy{})   = energyEl;
         electron(Dir{})      = energy * currentTrack(Dir{}) - newEnergyGamma * newDirGamma;
         electron(Dir{}).Normalize();
@@ -210,7 +212,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
         G4HepEmGammaInteractionPhotoelectric::SamplePhotoElectronDirection(photoElecE, dirGamma, dirPhotoElec, &rnge);
 
         InitAsSecondary(electron, /*parent=*/currentTrack);
-        electron(RngState{}) = newRNG;
+        electron(RngState{}) = newRNG.vr;
         electron(Energy{})   = photoElecE;
         electron(Dir{}).Set(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
       } else {

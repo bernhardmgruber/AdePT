@@ -135,7 +135,7 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numEvents; i += blockDim.x * gridDim.x) {
     auto &&track = generator.NextTrack();
 
-    track(RngState{}).SetSeed(startEvent + i);
+    RanluxppDoubleLlama{track(RngState{})}.SetSeed(startEvent + i);
     track(Energy{})       = energy;
     track(NumIALeft{})[0] = -1.0;
     track(NumIALeft{})[1] = -1.0;
@@ -174,7 +174,8 @@ __global__ void ClearQueue(adept::MParray *queue)
 }
 
 template <typename View>
-void reportHits(View tracks, cudaStream_t stream) {
+void reportHits(View tracks, cudaStream_t stream)
+{
   if constexpr (llama::mapping::isTrace<typename View::Mapping>) {
     std::byte *hitsArrayBlob = tracks.storageBlobs.back();
     typename View::Mapping::FieldHitsArray hits;
