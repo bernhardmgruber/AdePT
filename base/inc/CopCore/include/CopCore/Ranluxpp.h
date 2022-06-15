@@ -22,9 +22,8 @@ __device__ const uint64_t kA_2048[] = {
 } // end anonymous namespace
 
 template <int w>
-class RanluxppEngineImpl {
+struct RanluxppEngineImpl {
 
-private:
   uint64_t fState[9]; ///< RANLUX state of the generator
   unsigned fCarry;    ///< Carry bit of the RANLUX state
   int fPosition = 0;  ///< Current position in bits
@@ -32,7 +31,6 @@ private:
   static constexpr const uint64_t *kA = kA_2048;
   static constexpr int kMaxPos        = 9 * 64;
 
-protected:
   __host__ __device__
   void SaveState(uint64_t *state) const
   {
@@ -49,7 +47,6 @@ protected:
     }
   }
 
-public:
   RanluxppEngineImpl() = default;
 
   /// Produce next block of random bits

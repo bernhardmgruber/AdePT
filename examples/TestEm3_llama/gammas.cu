@@ -30,9 +30,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     const int volumeID   = currentTrack(NavState{}).Top()->id();
     const int theMCIndex = MCIndex[volumeID];
 
-    auto survive = [&] {
-      activeQueue->push_back(slot);
-    };
+    auto survive = [&] { activeQueue->push_back(slot); };
 
     // Init a track with the needed data to call into G4HepEm.
     G4HepEmGammaTrack gammaTrack;
@@ -40,11 +38,13 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     theTrack->SetEKin(currentTrack(Energy{}));
     theTrack->SetMCIndex(theMCIndex);
 
+    auto rngRef = makeRngRef(currentTrack(RngState{})); // reference to RNG in memory
+
     // Sample the `number-of-interaction-left` and put it into the track.
     for (int ip = 0; ip < 3; ++ip) {
       double &numIALeft = currentTrack(NumIALeft{})[ip];
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        numIALeft = -std::log(rngRef.Rndm());
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     }
@@ -107,9 +107,9 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     currentTrack(NumIALeft{})[winnerProcessIndex] = -1.0;
 
     // Perform the discrete interaction.
-    RanluxppDoubleEngine rnge(&currentTrack(RngState{}));
+    RanluxppDoubleEngineRef rnge(&rngRef);
     // We might need one branched RNG state, prepare while threads are synchronized.
-    RanluxppDouble newRNG(currentTrack(RngState{}).Branch());
+    auto newRNG = rngRef.Branch();
 
     const double energy = currentTrack(Energy{});
 
@@ -137,8 +137,8 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
       atomicAdd(&globalScoring->numPositrons, 1);
 
       InitAsSecondary(electron, /*parent=*/currentTrack);
-      electron(RngState{}) = newRNG;
-      electron(Energy{})   = elKinEnergy;
+      storeRng(electron(RngState{}), newRNG);
+      electron(Energy{}) = elKinEnergy;
       electron(Dir{}).Set(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
 
       InitAsSecondary(positron, /*parent=*/currentTrack);
@@ -170,9 +170,9 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
         atomicAdd(&globalScoring->numElectrons, 1);
 
         InitAsSecondary(electron, /*parent=*/currentTrack);
-        electron(RngState{}) = newRNG;
-        electron(Energy{})   = energyEl;
-        electron(Dir{})      = energy * currentTrack(Dir{}) - newEnergyGamma * newDirGamma;
+        storeRng(electron(RngState{}), newRNG);
+        electron(Energy{}) = energyEl;
+        electron(Dir{})    = energy * currentTrack(Dir{}) - newEnergyGamma * newDirGamma;
         electron(Dir{}).Normalize();
       } else {
         atomicAdd(&globalScoring->energyDeposit, energyEl);
@@ -210,8 +210,8 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
         G4HepEmGammaInteractionPhotoelectric::SamplePhotoElectronDirection(photoElecE, dirGamma, dirPhotoElec, &rnge);
 
         InitAsSecondary(electron, /*parent=*/currentTrack);
-        electron(RngState{}) = newRNG;
-        electron(Energy{})   = photoElecE;
+        storeRng(electron(RngState{}), newRNG);
+        electron(Energy{}) = photoElecE;
         electron(Dir{}).Set(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
       } else {
         edep = energy;
