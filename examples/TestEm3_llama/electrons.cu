@@ -73,7 +73,8 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     // Prepare a branched RNG state while threads are synchronized. Even if not
     // used, this provides a fresh round of random numbers and reduces thread
     // divergence because the RNG state doesn't need to be advanced later.
-    RanluxppDouble newRNG(currentTrack(RngState{}).BranchNoAdvance());
+    auto rngRef = currentTrack(RngState{}); // reference to RNG in memory
+    auto newRNG = ranlux::BranchNoAdvance(rngRef);
 
     // Compute safety, needed for MSC step limit.
     double safety = 0;
@@ -82,14 +83,14 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     }
     theTrack->SetSafety(safety);
 
-    RanluxppDoubleEngine rnge(&currentTrack(RngState{}));
+    RanluxppDoubleEngineLlama rnge(&rngRef);
 
     // Sample the `number-of-interaction-left` and put it into the track.
     boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
       constexpr int ip = decltype(ic)::value;
       double numIALeft = currentTrack(NumIALeft{}, llama::RecordCoord<ip>{});
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        numIALeft = -std::log(ranlux::NextRandomFloat(rngRef));
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     });
@@ -201,14 +202,14 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
         auto &&gamma2 = secondaries.gammas.NextTrack();
         atomicAdd(&globalScoring->numGammas, 2);
 
-        const double cost = 2 * currentTrack(RngState{}).Rndm() - 1;
+        const double cost = 2 * ranlux::NextRandomFloat(rngRef) - 1;
         const double sint = sqrt(1 - cost * cost);
-        const double phi  = k2Pi * currentTrack(RngState{}).Rndm();
+        const double phi  = k2Pi * ranlux::NextRandomFloat(rngRef);
         double sinPhi, cosPhi;
         sincos(phi, &sinPhi, &cosPhi);
 
         InitAsSecondary(gamma1, pos, navState);
-        newRNG.Advance();
+        ranlux::Advance(newRNG);
         gamma1(RngState{}) = newRNG;
         gamma1(Energy{})   = copcore::units::kElectronMassC2;
         gamma1(Dir{}).Set(sint * cosPhi, sint * sinPhi, cost);
@@ -254,7 +255,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     });
 
     // Check if a delta interaction happens instead of the real discrete process.
-    if (G4HepEmElectronManager::CheckDelta(&g4HepEmData, theTrack, currentTrack(RngState{}).Rndm())) {
+    if (G4HepEmElectronManager::CheckDelta(&g4HepEmData, theTrack, ranlux::NextRandomFloat(rngRef))) {
       // A delta interaction happened, move on.
       survive();
       continue;
@@ -262,10 +263,10 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
 
     // Perform the discrete interaction, make sure the branched RNG state is
     // ready to be used.
-    newRNG.Advance();
+    ranlux::Advance(newRNG);
     // Also advance the current RNG state to provide a fresh round of random
     // numbers after MSC used up a fair share for sampling the displacement.
-    currentTrack(RngState{}).Advance();
+    ranlux::Advance(rngRef);
 
     const double theElCut = g4HepEmData.fTheMatCutData->fMatCutData[theMCIndex].fSecElProdCutE;
 
