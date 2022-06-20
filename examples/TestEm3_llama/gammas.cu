@@ -48,12 +48,14 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     theTrack->SetEKin(energy);
     theTrack->SetMCIndex(theMCIndex);
 
+    auto rngRef = currentTrack(RngState{}); // reference to RNG in memory
+
     // Sample the `number-of-interaction-left` and put it into the track.
     boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
       constexpr int ip = decltype(ic)::value;
       double numIALeft = currentTrack(NumIALeft{}, llama::RecordCoord<ip>{});
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        numIALeft = -std::log(ranlux::NextRandomFloat(rngRef));
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     });
@@ -118,9 +120,9 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     });
 
     // Perform the discrete interaction.
-    RanluxppDoubleEngine rnge(&currentTrack(RngState{}));
+    RanluxppDoubleEngineLlama rnge(&rngRef);
     // We might need one branched RNG state, prepare while threads are synchronized.
-    RanluxppDouble newRNG(currentTrack(RngState{}).Branch());
+    auto newRNG = ranlux::Branch(rngRef);
 
     switch (winnerProcessIndex) {
     case 0: {

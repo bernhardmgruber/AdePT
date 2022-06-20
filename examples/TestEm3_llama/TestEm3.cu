@@ -135,7 +135,7 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numEvents; i += blockDim.x * gridDim.x) {
     auto &&track = generator.NextTrack();
 
-    track(RngState{}).SetSeed(startEvent + i);
+    ranlux::SetSeed(track(RngState{}), startEvent + i);
     track(Energy{})       = energy;
     track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
     track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
