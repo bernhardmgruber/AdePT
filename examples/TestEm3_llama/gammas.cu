@@ -23,10 +23,15 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                 ScoringPerVolume *scoringPerVolume)
 {
+  constexpr auto mapping = RngStateMapping{};
+  __shared__ std::byte sharedRngStorage[mapping.blobSize(0)];
+  llama::View sharedRngs{mapping, llama::Array{&sharedRngStorage[0]}};
+
   int activeSize = active->size();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot       = (*active)[i];
     auto &&currentTrack  = gammas[slot];
+    auto &rng            = (sharedRngs[threadIdx.x] = currentTrack(RngState{}));
     auto energy          = currentTrack(Energy{});
     auto pos             = currentTrack(Pos{});
     auto dir             = currentTrack(Dir{});
@@ -35,6 +40,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     const int theMCIndex = MCIndex[volumeID];
 
     auto survive = [&] {
+      currentTrack(RngState{}) = rng;
       currentTrack(Energy{})   = energy;
       currentTrack(Pos{})      = pos;
       currentTrack(Dir{})      = dir;
@@ -53,7 +59,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
       constexpr int ip = decltype(ic)::value;
       double numIALeft = currentTrack(NumIALeft{}, llama::RecordCoord<ip>{});
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        numIALeft = -std::log(rng.Rndm());
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     });
@@ -118,9 +124,9 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     });
 
     // Perform the discrete interaction.
-    RanluxppDoubleEngine rnge(&currentTrack(RngState{}));
+    RanluxppDoubleEngine rnge(&rng);
     // We might need one branched RNG state, prepare while threads are synchronized.
-    RanluxppDouble newRNG(currentTrack(RngState{}).Branch());
+    RanluxppDouble newRNG(rng.Branch());
 
     switch (winnerProcessIndex) {
     case 0: {
@@ -152,7 +158,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
 
       InitAsSecondary(positron, pos, navState);
       // Reuse the RNG state of the dying track.
-      positron(RngState{}) = currentTrack(RngState{});
+      positron(RngState{}) = rng;
       positron(Energy{})   = posKinEnergy;
       positron(Dir{}).Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
 

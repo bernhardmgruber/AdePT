@@ -18,6 +18,9 @@
 #include <VecGeom/base/Vector3D.h>
 #include <VecGeom/navigation/NavStateIndex.h>
 
+struct State {};
+struct Carry {};
+struct BitPos {};
 struct RngState {};
 struct Energy {};
 struct NumIALeft {};
@@ -30,6 +33,8 @@ struct NavState {};
 
 // A data structure to represent a particle track. The particle type is implicit
 // by the queue and not stored in memory.
+using RanluxDbl =
+    llama::Record<llama::Field<State, uint64_t[9]>, llama::Field<Carry, unsigned>, llama::Field<BitPos, int>>;
 using Track = llama::Record<
     llama::Field<RngState, RanluxppDouble>, llama::Field<Energy, double>, llama::Field<NumIALeft, double[3]>,
     llama::Field<InitialRange, double>, llama::Field<DynamicRangeFactor, double>, llama::Field<TlimitMin, double>,
@@ -116,6 +121,10 @@ using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>;
 // long, true>;
 using BlobType = std::byte *;
 using View     = llama::View<Mapping, BlobType>;
+
+constexpr int TransportThreads = 32;
+
+using RngStateMapping = llama::mapping::AoS<llama::ArrayExtents<int, TransportThreads>, RanluxppDouble>;
 
 // A bundle of pointers to generate particles of an implicit type.
 class ParticleGenerator {

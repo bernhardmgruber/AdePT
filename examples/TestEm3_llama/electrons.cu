@@ -34,6 +34,10 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
                                                           GlobalScoring *globalScoring,
                                                           ScoringPerVolume *scoringPerVolume)
 {
+  constexpr auto mapping = RngStateMapping{};
+  __shared__ std::byte sharedRngStorage[mapping.blobSize(0)];
+  llama::View sharedRngs{mapping, llama::Array{&sharedRngStorage[0]}};
+
   constexpr int Charge  = IsElectron ? -1 : 1;
   constexpr double Mass = copcore::units::kElectronMassC2;
   fieldPropagatorConstBz fieldPropagatorBz(BzFieldValue);
@@ -42,6 +46,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot       = (*active)[i];
     auto &&currentTrack  = electrons[slot];
+    auto &rng            = (sharedRngs[threadIdx.x] = currentTrack(RngState{}));
     auto energy          = currentTrack(Energy{});
     auto pos             = currentTrack(Pos{});
     auto dir             = currentTrack(Dir{});
@@ -50,6 +55,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     const int theMCIndex = MCIndex[volumeID];
 
     auto survive = [&] {
+      currentTrack(RngState{}) = rng;
       currentTrack(Energy{})   = energy;
       currentTrack(Pos{})      = pos;
       currentTrack(Dir{})      = dir;
@@ -73,7 +79,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     // Prepare a branched RNG state while threads are synchronized. Even if not
     // used, this provides a fresh round of random numbers and reduces thread
     // divergence because the RNG state doesn't need to be advanced later.
-    RanluxppDouble newRNG(currentTrack(RngState{}).BranchNoAdvance());
+    RanluxppDouble newRNG(rng.BranchNoAdvance());
 
     // Compute safety, needed for MSC step limit.
     double safety = 0;
@@ -82,14 +88,14 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     }
     theTrack->SetSafety(safety);
 
-    RanluxppDoubleEngine rnge(&currentTrack(RngState{}));
+    RanluxppDoubleEngine rnge(&rng);
 
     // Sample the `number-of-interaction-left` and put it into the track.
     boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
       constexpr int ip = decltype(ic)::value;
       double numIALeft = currentTrack(NumIALeft{}, llama::RecordCoord<ip>{});
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        numIALeft = -std::log(rng.Rndm());
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     });
@@ -201,9 +207,9 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
         auto &&gamma2 = secondaries.gammas.NextTrack();
         atomicAdd(&globalScoring->numGammas, 2);
 
-        const double cost = 2 * currentTrack(RngState{}).Rndm() - 1;
+        const double cost = 2 * rng.Rndm() - 1;
         const double sint = sqrt(1 - cost * cost);
-        const double phi  = k2Pi * currentTrack(RngState{}).Rndm();
+        const double phi  = k2Pi * rng.Rndm();
         double sinPhi, cosPhi;
         sincos(phi, &sinPhi, &cosPhi);
 
@@ -215,7 +221,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
 
         InitAsSecondary(gamma2, pos, navState);
         // Reuse the RNG state of the dying track.
-        gamma2(RngState{}) = currentTrack(RngState{});
+        gamma2(RngState{}) = rng;
         gamma2(Energy{})   = copcore::units::kElectronMassC2;
         gamma2(Dir{})      = -gamma1(Dir{});
       }
@@ -254,7 +260,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     });
 
     // Check if a delta interaction happens instead of the real discrete process.
-    if (G4HepEmElectronManager::CheckDelta(&g4HepEmData, theTrack, currentTrack(RngState{}).Rndm())) {
+    if (G4HepEmElectronManager::CheckDelta(&g4HepEmData, theTrack, rng.Rndm())) {
       // A delta interaction happened, move on.
       survive();
       continue;
@@ -265,7 +271,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     newRNG.Advance();
     // Also advance the current RNG state to provide a fresh round of random
     // numbers after MSC used up a fair share for sampling the displacement.
-    currentTrack(RngState{}).Advance();
+    rng.Advance();
 
     const double theElCut = g4HepEmData.fTheMatCutData->fMatCutData[theMCIndex].fSecElProdCutE;
 
@@ -337,7 +343,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
 
       InitAsSecondary(gamma2, pos, navState);
       // Reuse the RNG state of the dying track.
-      gamma2(RngState{}) = currentTrack(RngState{});
+      gamma2(RngState{}) = rng;
       gamma2(Energy{})   = theGamma2Ekin;
       gamma2(Dir{}).Set(theGamma2Dir[0], theGamma2Dir[1], theGamma2Dir[2]);
 
