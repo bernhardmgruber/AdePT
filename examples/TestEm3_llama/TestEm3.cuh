@@ -4,19 +4,14 @@
 #ifndef TESTEM3_CUH
 #define TESTEM3_CUH
 
-#include "TestEm3.h"
-
 #include "llama.hpp"
+#include "TestEm3.h"
 #include <AdePT/MParray.h>
 #include <CopCore/SystemOfUnits.h>
 #include <CopCore/Ranluxpp.h>
-
-#include <G4HepEmData.hh>
-#include <G4HepEmParameters.hh>
-#include <G4HepEmRandomEngine.hh>
-
 #include <VecGeom/base/Vector3D.h>
 #include <VecGeom/navigation/NavStateIndex.h>
+#include <cmath>
 
 struct State {};
 struct Carry {};
@@ -42,27 +37,26 @@ using Track =
                   llama::Field<Dir, vecgeom::Vector3D<vecgeom::Precision>>,
                   llama::Field<NavState, vecgeom::NavStateIndex>>;
 
-template <typename SecondayTrack>
-__host__ __device__ void InitAsSecondary(SecondayTrack &&track, const vecgeom::Vector3D<Precision> &parentPos,
-                                         const vecgeom::NavStateIndex &parentNavState)
-{
-  // The caller is responsible to branch a new RNG state and to set the energy.
-  track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
-  track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
-  track(NumIALeft{}, llama::RecordCoord<2>{}) = -1.0;
+using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>;
+// using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
+// using Mapping  = llama::mapping::AlignedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
+//  using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
+//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 16>;
+//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 32>;
+//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 64>;
+//  using Mapping  = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>, unsigned long
+//  long, true>;
+using BlobType = std::byte *;
+using View     = llama::View<Mapping, BlobType>;
 
-  track(InitialRange{})       = -1.0;
-  track(DynamicRangeFactor{}) = -1.0;
-  track(TlimitMin{})          = -1.0;
+// we are providing the engine now :D
+#define G4HepEmRandomEngine_HH
 
-  // A secondary inherits the position of its parent; the caller is responsible
-  // to update the directions.
-  track(Pos{})      = parentPos;
-  track(NavState{}) = parentNavState;
-}
-
-// Defined in TestEm3.cu
-extern __constant__ __device__ int Zero;
+#include <G4HepEmMacros.hh>
+#include <G4HepEmMath.hh>
+#include <G4HepEmConstants.hh>
+#include <G4HepEmData.hh>
+#include <G4HepEmParameters.hh>
 
 namespace ranlux {
 inline constexpr const uint64_t *kA = kA_2048;
@@ -215,39 +209,95 @@ __host__ __device__ auto Branch(VR &&vr)
 }
 } // namespace ranlux
 
-template <typename VR>
-class RanluxppDoubleEngineLlama : public G4HepEmRandomEngine {
-  // Wrapper functions to call into RanluxppDouble.
-  static __host__ __device__ __attribute__((noinline)) double FlatWrapper(void *object)
-  {
-    // FIXME(bgruber): we are paying for two indirections here. The first one through the void*, the second one through
-    // the RecordRef. This could be fixed by not using a type erased interface in G4HepEm.
-    return ranlux::NextRandomFloat(*((VR *)object));
-  }
-  static __host__ __device__ __attribute__((noinline)) void FlatArrayWrapper(void *object, const int size, double *vect)
+using RanluxRecordRef = decltype(std::declval<View>()(0)(RngState{}));
+
+struct G4HepEmRandomEngine {
+  G4HepEmHostDevice G4HepEmRandomEngine(RanluxRecordRef rr) : recordRef(rr), fIsGauss(false), fGauss(0.) {}
+
+  // bgruber: avoiding inlining here makes the code actually faster
+  __noinline__ G4HepEmHostDevice double flat() { return ranlux::NextRandomFloat(recordRef); }
+
+    // bgruber: avoiding inlining here makes the code actually faster
+  __noinline__ G4HepEmHostDevice void flatArray(const int size, double *vect)
   {
     for (int i = 0; i < size; i++) {
-      vect[i] = ranlux::NextRandomFloat(*((VR *)object));
+      vect[i] = ranlux::NextRandomFloat(recordRef);
     }
   }
 
-public:
-  __host__ __device__ RanluxppDoubleEngineLlama(VR *vr)
-      : G4HepEmRandomEngine(/*object=*/vr, &FlatWrapper, &FlatArrayWrapper)
+  G4HepEmHostDevice double Gauss(const double mean, const double stDev)
   {
-#ifdef __CUDA_ARCH__
-    // This is a hack: The compiler cannot see that we're going to call the
-    // functions through their pointers, so it underestimates the number of
-    // required registers. By including calls to the (non-inlinable) functions
-    // we force the compiler to account for the register usage, even if this
-    // particular set of calls are not executed at runtime.
-    if (Zero) {
-      FlatWrapper(vr);
-      FlatArrayWrapper(vr, 0, nullptr);
+    if (fIsGauss) {
+      fIsGauss = false;
+      return fGauss * stDev + mean;
     }
-#endif
+    double rnd[2];
+    double r, v1, v2;
+    do {
+      flatArray(2, rnd);
+      v1 = 2. * rnd[0] - 1.;
+      v2 = 2. * rnd[1] - 1.;
+      r  = v1 * v1 + v2 * v2;
+    } while (r > 1.);
+    const double fac = std::sqrt(-2. * G4HepEmLog(r) / r);
+    fGauss           = v1 * fac;
+    fIsGauss         = true;
+    return v2 * fac * stDev + mean;
   }
+
+  G4HepEmHostDevice void DiscardGauss() { fIsGauss = false; }
+
+  G4HepEmHostDevice int Poisson(double mean)
+  {
+    const int border   = 16;
+    const double limit = 2.E+9;
+
+    int number = 0;
+    if (mean <= border) {
+      const double position = flat();
+      double poissonValue   = G4HepEmExp(-mean);
+      double poissonSum     = poissonValue;
+      while (poissonSum <= position) {
+        ++number;
+        poissonValue *= mean / number;
+        poissonSum += poissonValue;
+      }
+      return number;
+    } // the case of mean <= 16
+    //
+    double rnd[2];
+    flatArray(2, rnd);
+    const double t = std::sqrt(-2. * G4HepEmLog(rnd[0])) * std::cos(k2Pi * rnd[1]);
+    double value   = mean + t * std::sqrt(mean) + 0.5;
+    return value < 0. ? 0 : value >= limit ? static_cast<int>(limit) : static_cast<int>(value);
+  }
+
+  RanluxRecordRef recordRef;
+  double fGauss;
+  bool fIsGauss;
 };
+
+template <typename SecondayTrack>
+__host__ __device__ void InitAsSecondary(SecondayTrack &&track, const vecgeom::Vector3D<Precision> &parentPos,
+                                         const vecgeom::NavStateIndex &parentNavState)
+{
+  // The caller is responsible to branch a new RNG state and to set the energy.
+  track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
+  track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
+  track(NumIALeft{}, llama::RecordCoord<2>{}) = -1.0;
+
+  track(InitialRange{})       = -1.0;
+  track(DynamicRangeFactor{}) = -1.0;
+  track(TlimitMin{})          = -1.0;
+
+  // A secondary inherits the position of its parent; the caller is responsible
+  // to update the directions.
+  track(Pos{})      = parentPos;
+  track(NavState{}) = parentNavState;
+}
+
+// Defined in TestEm3.cu
+// extern __constant__ __device__ int Zero;
 
 // A data structure to manage slots in the track storage.
 class SlotManager {
@@ -264,18 +314,6 @@ public:
     return next;
   }
 };
-
-using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>;
-// using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-// using Mapping  = llama::mapping::AlignedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-//  using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 16>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 32>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 64>;
-//  using Mapping  = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>, unsigned long
-//  long, true>;
-using BlobType = std::byte *;
-using View     = llama::View<Mapping, BlobType>;
 
 // A bundle of pointers to generate particles of an implicit type.
 class ParticleGenerator {
