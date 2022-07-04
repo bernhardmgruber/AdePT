@@ -83,7 +83,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     }
     theTrack->SetSafety(safety);
 
-    RanluxppDoubleEngineLlama rnge(&rngRef);
+    G4HepEmRandomEngine rnge(rngRef);
 
     // Sample the `number-of-interaction-left` and put it into the track.
     boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {

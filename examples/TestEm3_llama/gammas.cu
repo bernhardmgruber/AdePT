@@ -120,7 +120,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     });
 
     // Perform the discrete interaction.
-    RanluxppDoubleEngineLlama rnge(&rngRef);
+    G4HepEmRandomEngine rnge(rngRef);
     // We might need one branched RNG state, prepare while threads are synchronized.
     auto newRNG = ranlux::Branch(rngRef);
 
