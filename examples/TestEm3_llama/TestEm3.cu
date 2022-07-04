@@ -136,7 +136,7 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
     auto &&track = generator.NextTrack();
 
     ranlux::SetSeed(track(RngState{}), startEvent + i);
-    track(Energy{})       = energy;
+    track(Energy{})                             = energy;
     track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
     track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
     track(NumIALeft{}, llama::RecordCoord<2>{}) = -1.0;
@@ -174,7 +174,8 @@ __global__ void ClearQueue(adept::MParray *queue)
 }
 
 template <typename View>
-void reportHits(View tracks, cudaStream_t stream) {
+void reportHits(View tracks, cudaStream_t stream)
+{
   if constexpr (llama::mapping::isTrace<typename View::Mapping>) {
     std::byte *hitsArrayBlob = tracks.storageBlobs.back();
     typename View::Mapping::FieldHitsArray hits;
@@ -222,6 +223,10 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
   }
 
   Mapping mapping(llama::ArrayExtentsDynamic<int, 1>{Capacity});
+
+  std::ofstream{"tracks.svg"} << llama::toSvg(Mapping{{32}},
+                                              128); // global mem access is grouped in 32, 64 or 128 bytes.
+  std::ofstream{"rng_sm.svg"} << llama::toSvg(RngStateMapping{}, 4 * 32); // 32 banks of 4 bytes
 
   // Allocate structures to manage tracks of an implicit type:
   //  * memory to hold the actual Track elements,
@@ -325,8 +330,7 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
     stats->inFlight[ParticleType::Positron] = 0;
     stats->inFlight[ParticleType::Gamma]    = 0;
 
-    constexpr int MaxBlocks        = 1024;
-    constexpr int TransportThreads = 32;
+    constexpr int MaxBlocks = 1024;
     int transportBlocks;
 
     int inFlight;

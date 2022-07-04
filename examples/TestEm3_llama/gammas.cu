@@ -23,10 +23,16 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                 ScoringPerVolume *scoringPerVolume)
 {
+  constexpr auto mapping = RngStateMapping{};
+  __shared__ std::byte sharedRngStorage[mapping.blobSize(0)];
+  llama::View sharedRngs{mapping, llama::Array{&sharedRngStorage[0]}};
+
   int activeSize = active->size();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot       = (*active)[i];
     auto &&currentTrack  = gammas[slot];
+    auto &&rngRef        = sharedRngs[threadIdx.x];
+    rngRef               = currentTrack(RngState{});
     auto energy          = currentTrack(Energy{});
     auto pos             = currentTrack(Pos{});
     auto dir             = currentTrack(Dir{});
@@ -35,6 +41,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     const int theMCIndex = MCIndex[volumeID];
 
     auto survive = [&] {
+      currentTrack(RngState{}) = rngRef;
       currentTrack(Energy{})   = energy;
       currentTrack(Pos{})      = pos;
       currentTrack(Dir{})      = dir;
@@ -47,8 +54,6 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     G4HepEmTrack *theTrack = gammaTrack.GetTrack();
     theTrack->SetEKin(energy);
     theTrack->SetMCIndex(theMCIndex);
-
-    auto rngRef = currentTrack(RngState{}); // reference to RNG in memory
 
     // Sample the `number-of-interaction-left` and put it into the track.
     boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
@@ -154,7 +159,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
 
       InitAsSecondary(positron, pos, navState);
       // Reuse the RNG state of the dying track.
-      positron(RngState{}) = currentTrack(RngState{});
+      positron(RngState{}) = rngRef;
       positron(Energy{})   = posKinEnergy;
       positron(Dir{}).Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
 

@@ -34,6 +34,10 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
                                                           GlobalScoring *globalScoring,
                                                           ScoringPerVolume *scoringPerVolume)
 {
+  constexpr auto mapping = RngStateMapping{};
+  __shared__ std::byte sharedRngStorage[mapping.blobSize(0)];
+  llama::View sharedRngs{mapping, llama::Array{&sharedRngStorage[0]}};
+
   constexpr int Charge  = IsElectron ? -1 : 1;
   constexpr double Mass = copcore::units::kElectronMassC2;
   fieldPropagatorConstBz fieldPropagatorBz(BzFieldValue);
@@ -42,6 +46,8 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot       = (*active)[i];
     auto &&currentTrack  = electrons[slot];
+    auto &&rngRef        = sharedRngs[threadIdx.x];
+    rngRef               = currentTrack(RngState{});
     auto energy          = currentTrack(Energy{});
     auto pos             = currentTrack(Pos{});
     auto dir             = currentTrack(Dir{});
@@ -50,6 +56,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     const int theMCIndex = MCIndex[volumeID];
 
     auto survive = [&] {
+      currentTrack(RngState{}) = rngRef;
       currentTrack(Energy{})   = energy;
       currentTrack(Pos{})      = pos;
       currentTrack(Dir{})      = dir;
@@ -73,7 +80,6 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     // Prepare a branched RNG state while threads are synchronized. Even if not
     // used, this provides a fresh round of random numbers and reduces thread
     // divergence because the RNG state doesn't need to be advanced later.
-    auto rngRef = currentTrack(RngState{}); // reference to RNG in memory
     auto newRNG = ranlux::BranchNoAdvance(rngRef);
 
     // Compute safety, needed for MSC step limit.
@@ -216,7 +222,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
 
         InitAsSecondary(gamma2, pos, navState);
         // Reuse the RNG state of the dying track.
-        gamma2(RngState{}) = currentTrack(RngState{});
+        gamma2(RngState{}) = rngRef;
         gamma2(Energy{})   = copcore::units::kElectronMassC2;
         gamma2(Dir{})      = -gamma1(Dir{});
       }
@@ -338,7 +344,7 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
 
       InitAsSecondary(gamma2, pos, navState);
       // Reuse the RNG state of the dying track.
-      gamma2(RngState{}) = currentTrack(RngState{});
+      gamma2(RngState{}) = rngRef;
       gamma2(Energy{})   = theGamma2Ekin;
       gamma2(Dir{}).Set(theGamma2Dir[0], theGamma2Dir[1], theGamma2Dir[2]);
 

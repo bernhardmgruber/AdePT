@@ -40,14 +40,19 @@ using Track =
 using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>;
 // using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
 // using Mapping  = llama::mapping::AlignedSingleBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-//  using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 16>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 32>;
-//  using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 64>;
-//  using Mapping  = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>, unsigned long
-//  long, true>;
+// using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<int, 1>, Track>;
+// using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 16>;
+// using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 32>;
+// using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<int, 1>, Track, 64>;
+// using Mapping  = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<int, 1>, Track>, unsigned long
+// long, true>;
 using BlobType = std::byte *;
 using View     = llama::View<Mapping, BlobType>;
+
+constexpr int TransportThreads = 32;
+
+// using RngStateMapping = llama::mapping::AoS<llama::ArrayExtents<int, TransportThreads>, RanluxDbl>;
+using RngStateMapping = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtents<int, TransportThreads>, RanluxDbl>;
 
 // we are providing the engine now :D
 #define G4HepEmRandomEngine_HH
@@ -209,15 +214,15 @@ __host__ __device__ auto Branch(VR &&vr)
 }
 } // namespace ranlux
 
-using RanluxRecordRef = decltype(std::declval<View>()(0)(RngState{}));
+using RanluxRecordRef = decltype(std::declval<llama::View<RngStateMapping, std::byte *>>()(0));
 
 struct G4HepEmRandomEngine {
-  G4HepEmHostDevice G4HepEmRandomEngine(RanluxRecordRef rr) : recordRef(rr), fIsGauss(false), fGauss(0.) {}
+  G4HepEmHostDevice G4HepEmRandomEngine(RanluxRecordRef rr) : recordRef(std::move(rr)), fIsGauss(false), fGauss(0.) {}
 
   // bgruber: avoiding inlining here makes the code actually faster
   __noinline__ G4HepEmHostDevice double flat() { return ranlux::NextRandomFloat(recordRef); }
 
-    // bgruber: avoiding inlining here makes the code actually faster
+  // bgruber: avoiding inlining here makes the code actually faster
   __noinline__ G4HepEmHostDevice void flatArray(const int size, double *vect)
   {
     for (int i = 0; i < size; i++) {
