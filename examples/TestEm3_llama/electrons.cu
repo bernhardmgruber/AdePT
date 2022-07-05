@@ -38,6 +38,13 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
   __shared__ std::byte sharedRngStorage[mapping.blobSize(0)];
   llama::View sharedRngs{mapping, llama::Array{&sharedRngStorage[0]}};
 
+  struct PaddedTrack {
+    G4HepEmElectronTrack t;
+    std::byte pad[sizeof(G4HepEmElectronTrack) % (32 * 4) + 8]; // TODO(bgruber): play here
+  };
+
+  __shared__ PaddedTrack elTracks[TransportThreads];
+
   constexpr int Charge  = IsElectron ? -1 : 1;
   constexpr double Mass = copcore::units::kElectronMassC2;
   fieldPropagatorConstBz fieldPropagatorBz(BzFieldValue);
@@ -64,7 +71,8 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     };
 
     // Init a track with the needed data to call into G4HepEm.
-    G4HepEmElectronTrack elTrack;
+    G4HepEmElectronTrack& elTrack = elTracks[threadIdx.x].t;
+
     G4HepEmTrack *theTrack = elTrack.GetTrack();
     theTrack->SetEKin(energy);
     theTrack->SetMCIndex(theMCIndex);
