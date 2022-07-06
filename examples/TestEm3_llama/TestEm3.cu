@@ -183,9 +183,19 @@ void reportHits(int iteration, std::string_view kernelName, View tracks, cudaStr
     typename View::Mapping::FieldHitsArray hits;
     // TODO(bgruber): we can improve this by using cudaMemsetAsync and print inside cudaLaunchHostFunc
     COPCORE_CUDA_CHECK(cudaMemcpy(&hits, hitsArrayBlob, sizeof(hits), cudaMemcpyDeviceToHost));
-    std::cout << "Iteration " << iteration << ' ' << kernelName << '\n';
-    tracks.mapping().printFieldHits(hits);
-    std::cout << '\n';
+
+    //    std::cout << "Iteration " << iteration << ' ' << kernelName << '\n';
+    //    tracks.mapping().printFieldHits(hits);
+    //    std::cout << '\n';
+
+    std::cout << iteration << " " << kernelName;
+    using RecordDim = typename View::Mapping::RecordDim;
+    llama::forEachLeafCoord<RecordDim>([&](auto coord) {
+      const auto h = hits[llama::flatRecordCoord<RecordDim, decltype(coord)>];
+      std::cout << " " << h.reads << " " << h.writes;
+    });
+    std::cout << "\n";
+
     COPCORE_CUDA_CHECK(cudaMemsetAsync(hitsArrayBlob, 0, sizeof(hits), stream));
   }
 }
@@ -299,10 +309,22 @@ void TestEm3(const vecgeom::cxx::VPlacedVolume *world, int numParticles, double 
   vecgeom::Stopwatch timer;
   timer.Start();
 
+  constexpr bool tracing = llama::mapping::isTrace<typename View::Mapping>;
+
   std::cout << std::endl << "Simulating particles ";
-  const bool detailed = (numParticles / batch) < 50;
+  const bool detailed = !tracing && (numParticles / batch) < 50;
   if (!detailed) {
     std::cout << "... " << std::flush;
+  }
+
+  if constexpr (tracing) {
+    using RecordDim = typename View::Mapping::RecordDim;
+    std::cout << "\nIteration Kernel";
+    llama::forEachLeafCoord<RecordDim>([](auto coord) {
+      auto name = llama::recordCoordTags<RecordDim>(coord);
+      std::cout << " " << name << "_R " << name << "_W";
+    });
+    std::cout << "\n";
   }
 
   unsigned long long killed = 0;
