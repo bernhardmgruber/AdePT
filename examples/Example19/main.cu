@@ -31,6 +31,9 @@
 
 #include <iostream>
 #include <iomanip>
+#include <fstream>
+#include <vector>
+#include <array>
 #include <stdio.h>
 
 __constant__ __device__ struct G4HepEmParameters g4HepEmPars;
@@ -75,7 +78,7 @@ struct ParticleQueues {
 };
 
 struct ParticleType {
-  Track *tracks;
+  View tracks;
   SlotManager *slotManager;
   ParticleQueues queues;
   cudaStream_t stream;
@@ -108,32 +111,32 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
                               const vecgeom::VPlacedVolume *world, GlobalScoring *globalScoring, const GunConfig gun)
 {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numEvents; i += blockDim.x * gridDim.x) {
-    Track &track = generator.NextTrack();
+    auto &&track = generator.NextTrack();
 
-    track.rngState.SetSeed(startEvent + i);
-    track.energy       = energy;
-    track.numIALeft[0] = -1.0;
-    track.numIALeft[1] = -1.0;
-    track.numIALeft[2] = -1.0;
+    track(RngState{}).SetSeed(startEvent + i);
+    track(Energy{})                             = energy;
+    track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
+    track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
+    track(NumIALeft{}, llama::RecordCoord<2>{}) = -1.0;
 
-    track.initialRange       = -1.0;
-    track.dynamicRangeFactor = -1.0;
-    track.tlimitMin          = -1.0;
+    track(InitialRange{})       = -1.0;
+    track(DynamicRangeFactor{}) = -1.0;
+    track(TlimitMin{})          = -1.0;
 
-    track.pos = {gun.position[0], gun.position[1], gun.position[2]};
+    track(Pos{}) = {gun.position[0], gun.position[1], gun.position[2]};
     if (gun.movingGun) {
       // Generate particles flat in phi and in eta between -5 and 5. We'll lose the far forwards ones, so no need to
       // simulate.
-      const double phi = 2. * M_PI * track.rngState.Rndm();
-      const double eta = -5. + 10. * track.rngState.Rndm();
-      track.dir.x()    = static_cast<vecgeom::Precision>(cos(phi) / cosh(eta));
-      track.dir.y()    = static_cast<vecgeom::Precision>(sin(phi) / cosh(eta));
-      track.dir.z()    = static_cast<vecgeom::Precision>(tanh(eta));
+      const double phi = 2. * M_PI * track(RngState{}).Rndm();
+      const double eta = -5. + 10. * track(RngState{}).Rndm();
+      track(Dir{}).x() = static_cast<vecgeom::Precision>(cos(phi) / cosh(eta));
+      track(Dir{}).y() = static_cast<vecgeom::Precision>(sin(phi) / cosh(eta));
+      track(Dir{}).z() = static_cast<vecgeom::Precision>(tanh(eta));
     } else {
-      track.dir = {gun.direction[0], gun.direction[1], gun.direction[2]};
+      track(Dir{}) = {gun.direction[0], gun.direction[1], gun.direction[2]};
     }
-    track.navState.Clear();
-    BVHNavigator::LocatePointIn(world, track.pos, track.navState, true);
+    track(NavState{}).Clear();
+    BVHNavigator::LocatePointIn(world, track(Pos{}), track(NavState{}), true);
 
     atomicAdd(&globalScoring->numElectrons, 1);
   }
@@ -158,6 +161,42 @@ __global__ void ClearQueue(adept::MParray *queue)
   queue->clear();
 }
 
+template <typename View>
+void reportHits(View tracks, cudaStream_t stream)
+{
+  if constexpr (llama::mapping::isTrace<typename View::Mapping>) {
+    std::byte *hitsArrayBlob = tracks.storageBlobs.back();
+    typename View::Mapping::FieldHitsArray hits;
+    COPCORE_CUDA_CHECK(cudaMemcpy(&hits, hitsArrayBlob, sizeof(hits), cudaMemcpyDeviceToHost));
+    tracks.mapping().printFieldHits(hits);
+    COPCORE_CUDA_CHECK(cudaMemsetAsync(hitsArrayBlob, 0, sizeof(hits), stream));
+  }
+}
+
+template <typename View>
+void printHeatmaps(View electrons, View positrons, View gammas)
+{
+  if constexpr (llama::mapping::isHeatmap<Mapping>) {
+    std::cout << "Writing heatmaps ..." << std::endl;
+    auto printHeatmap = [](View view, std::string name) {
+      // transfer only shadow blobs
+      std::array<std::vector<std::byte>, View::Mapping::blobCount> blobs;
+      for (auto i = blobs.size() / 2; i < blobs.size(); i++) {
+        const auto bs = view.mapping().blobSize(i);
+        blobs[i].resize(bs);
+        COPCORE_CUDA_CHECK(cudaMemcpy(blobs[i].data(), view.storageBlobs[i], bs, cudaMemcpyDeviceToHost));
+      }
+      const auto filename = "heatmap_" + name + ".bin";
+      std::cout << "  " << filename << " ..." << std::endl;
+      view.mapping().writeGnuplotDataFileBinary(blobs, std::ofstream{filename}, 4096);
+    };
+    std::ofstream{"plot_heatmap.sh"} << View::Mapping::gnuplotScriptBinary;
+    printHeatmap(electrons, "electrons");
+    printHeatmap(positrons, "positrons");
+    printHeatmap(gammas, "gammas");
+  }
+}
+
 void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
             ScoringPerVolume *scoringPerVolume_host, GlobalScoring *globalScoring_host, int numVolumes, int numPlaced,
             G4HepEmState *state, GunConfig gunConfig)
@@ -177,7 +216,8 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
 
   // Capacity of the different containers aka the maximum number of particles.
   // Use 26% of GPU memory for each of e+/e-/gammas, leaving 22% for the rest.
-  const size_t Capacity = (deviceProp.totalGlobalMem / sizeof(Track)) * 26 / 100;
+  const size_t Capacity =
+      llama::mapping::isHeatmap<Mapping> ? 50'000 : (deviceProp.totalGlobalMem / llama::sizeOf<Track>)*26 / 100;
 
   std::cout << "INFO: capacity of containers set to " << Capacity << std::endl;
   if (batch == -1) {
@@ -193,19 +233,29 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
     std::cout << "INFO: running with magnetic field OFF" << std::endl;
   }
 
+  Mapping mapping(llama::ArrayExtentsDynamic<std::size_t, 1>{Capacity}); // FIXME(bgruber): might be too small on V100
+
+  {
+    Mapping smallMapping(llama::ArrayExtentsDynamic<std::size_t, 1>{32});
+    std::ofstream{"tracklayout.svg"} << llama::toSvg(smallMapping);
+    std::ofstream{"tracklayout.html"} << llama::toHtml(smallMapping);
+  }
+
   // Allocate structures to manage tracks of an implicit type:
   //  * memory to hold the actual Track elements,
   //  * objects to manage slots inside the memory,
   //  * queues of slots to remember active particle and those needing relocation,
   //  * a stream and an event for synchronization of kernels.
-  const size_t TracksSize  = sizeof(Track) * Capacity;
   const size_t ManagerSize = sizeof(SlotManager);
   const size_t QueueSize   = adept::MParray::SizeOfInstance(Capacity);
 
   ParticleType particles[ParticleType::NumParticleTypes];
   for (int i = 0; i < ParticleType::NumParticleTypes; i++) {
-    COPCORE_CUDA_CHECK(cudaMalloc(&particles[i].tracks, TracksSize));
-
+    particles[i].tracks = llama::allocViewUninitialized(mapping, [](auto alignment, auto size) {
+      std::byte *p = nullptr;
+      COPCORE_CUDA_CHECK(cudaMalloc(&p, size));
+      return p;
+    });
     COPCORE_CUDA_CHECK(cudaMalloc(&particles[i].slotManager, ManagerSize));
 
     COPCORE_CUDA_CHECK(cudaMalloc(&particles[i].queues.currentlyActive, QueueSize));
@@ -467,6 +517,8 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
   auto time = timer.Stop();
   std::cout << "Run time: " << time << "\n";
 
+  printHeatmaps(electrons.tracks, positrons.tracks, gammas.tracks);
+
   // Transfer back scoring.
   COPCORE_CUDA_CHECK(cudaMemcpy(globalScoring_host, globalScoring, sizeof(GlobalScoring), cudaMemcpyDeviceToHost));
   globalScoring_host->numKilled = killed;
@@ -494,7 +546,8 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
     COPCORE_CUDA_CHECK(cudaStreamDestroy(interactionStreams[i]));
 
   for (int i = 0; i < ParticleType::NumParticleTypes; i++) {
-    COPCORE_CUDA_CHECK(cudaFree(particles[i].tracks));
+    for (auto *p : particles[i].tracks.storageBlobs)
+      COPCORE_CUDA_CHECK(cudaFree(p));
     COPCORE_CUDA_CHECK(cudaFree(particles[i].slotManager));
 
     COPCORE_CUDA_CHECK(cudaFree(particles[i].queues.currentlyActive));
