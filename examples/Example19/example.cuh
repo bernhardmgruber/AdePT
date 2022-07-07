@@ -38,8 +38,6 @@ struct Track {
   vecgeom::Vector3D<Precision> dir;
   vecgeom::NavStateIndex navState;
 
-  __host__ __device__ double Uniform() { return rngState.Rndm(); }
-
   __host__ __device__ void InitAsSecondary(const Track &parent)
   {
     // The caller is responsible to branch a new RNG state and to set the energy.
