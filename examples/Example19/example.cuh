@@ -60,9 +60,6 @@ struct SOAData {
   double *gamma_PEmxSec = nullptr;
 };
 
-// Defined in example18.cu
-extern __constant__ __device__ int Zero;
-
 class RanluxppDoubleEngine : public G4HepEmRandomEngine {
   // Wrapper functions to call into RanluxppDouble.
   static __host__ __device__ double FlatWrapper(void *object)
@@ -80,17 +77,6 @@ public:
   __host__ __device__ RanluxppDoubleEngine(RanluxppDouble *engine)
       : G4HepEmRandomEngine(/*object=*/engine, &FlatWrapper, &FlatArrayWrapper)
   {
-#ifdef __CUDA_ARCH__
-    // This is a hack: The compiler cannot see that we're going to call the
-    // functions through their pointers, so it underestimates the number of
-    // required registers. By including calls to the (non-inlinable) functions
-    // we force the compiler to account for the register usage, even if this
-    // particular set of calls are not executed at runtime.
-    if (Zero) {
-      FlatWrapper(engine);
-      FlatArrayWrapper(engine, 0, nullptr);
-    }
-#endif
   }
 };
 
