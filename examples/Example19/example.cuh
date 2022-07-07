@@ -33,25 +33,25 @@ struct Track {
   vecgeom::Vector3D<Precision> pos;
   vecgeom::Vector3D<Precision> dir;
   vecgeom::NavStateIndex navState;
-
-  __host__ __device__ void InitAsSecondary(const vecgeom::Vector3D<Precision> &parentPos,
-                                           const vecgeom::NavStateIndex &parentNavState)
-  {
-    // The caller is responsible to branch a new RNG state and to set the energy.
-    this->numIALeft[0] = -1.0;
-    this->numIALeft[1] = -1.0;
-    this->numIALeft[2] = -1.0;
-
-    this->initialRange       = -1.0;
-    this->dynamicRangeFactor = -1.0;
-    this->tlimitMin          = -1.0;
-
-    // A secondary inherits the position of its parent; the caller is responsible
-    // to update the directions.
-    this->pos      = parentPos;
-    this->navState = parentNavState;
-  }
 };
+
+__host__ __device__ inline void InitAsSecondary(Track &track, const vecgeom::Vector3D<Precision> &parentPos,
+                                                const vecgeom::NavStateIndex &parentNavState)
+{
+  // The caller is responsible to branch a new RNG state and to set the energy.
+  track.numIALeft[0] = -1.0;
+  track.numIALeft[1] = -1.0;
+  track.numIALeft[2] = -1.0;
+
+  track.initialRange       = -1.0;
+  track.dynamicRangeFactor = -1.0;
+  track.tlimitMin          = -1.0;
+
+  // A secondary inherits the position of its parent; the caller is responsible
+  // to update the directions.
+  track.pos      = parentPos;
+  track.navState = parentNavState;
+}
 
 // Struct for communication between kernels
 struct SOAData {
