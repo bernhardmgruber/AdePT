@@ -34,8 +34,6 @@ struct Track {
   vecgeom::Vector3D<Precision> dir;
   vecgeom::NavStateIndex navState;
 
-  __host__ __device__ double Uniform() { return rngState.Rndm(); }
-
   __host__ __device__ void InitAsSecondary(const vecgeom::Vector3D<Precision> &parentPos,
                                            const vecgeom::NavStateIndex &parentNavState)
   {

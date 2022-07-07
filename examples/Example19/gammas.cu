@@ -61,7 +61,7 @@ __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Sec
     for (int ip = 0; ip < 3; ++ip) {
       double numIALeft = currentTrack.numIALeft[ip];
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack.Uniform());
+        numIALeft = -std::log(currentTrack.rngState.Rndm());
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     }
