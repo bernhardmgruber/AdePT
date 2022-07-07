@@ -19,7 +19,7 @@
 #include <G4HepEmGammaInteractionConversion.icc>
 #include <G4HepEmGammaInteractionPhotoelectric.icc>
 
-__global__ void TransportGammas(Track *gammas, const adept::MParray *active, Secondaries secondaries,
+__global__ void TransportGammas(View gammas, const adept::MParray *active, Secondaries secondaries,
                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                 ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
@@ -31,11 +31,11 @@ __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Sec
   int activeSize = active->size();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot      = (*active)[i];
-    Track &currentTrack = gammas[slot];
-    const auto energy   = currentTrack.energy;
-    auto pos            = currentTrack.pos;
-    const auto dir      = currentTrack.dir;
-    auto navState       = currentTrack.navState;
+    auto &&currentTrack = gammas[slot];
+    const auto energy   = currentTrack(Energy{});
+    auto pos            = currentTrack(Pos{});
+    const auto dir      = currentTrack(Dir{});
+    auto navState       = currentTrack(NavState{});
     const auto volume   = navState.Top();
     const int volumeID  = volume->id();
     // the MCC vector is indexed by the logical volume id
@@ -43,8 +43,8 @@ __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Sec
     const int theMCIndex = MCIndex[lvolID];
 
     auto survive = [&](bool push = true) {
-      currentTrack.pos      = pos;
-      currentTrack.navState = navState;
+      currentTrack(Pos{})      = pos;
+      currentTrack(NavState{}) = navState;
       if (push) activeQueue->push_back(slot);
     };
 
@@ -58,13 +58,14 @@ __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Sec
     theTrack->SetMCIndex(theMCIndex);
 
     // Sample the `number-of-interaction-left` and put it into the track.
-    for (int ip = 0; ip < 3; ++ip) {
-      double numIALeft = currentTrack.numIALeft[ip];
+    boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
+      constexpr int ip = decltype(ic)::value;
+      double numIALeft = currentTrack(NumIALeft{}, llama::RecordCoord<ip>{});
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack.rngState.Rndm());
+        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
       }
       theTrack->SetNumIALeft(numIALeft, ip);
-    }
+    });
 
     // Call G4HepEm to compute the physics step limit.
     G4HepEmGammaManager::HowFar(&g4HepEmData, &g4HepEmPars, &gammaTrack);
@@ -94,10 +95,11 @@ __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Sec
     G4HepEmGammaManager::UpdateNumIALeft(theTrack);
 
     // Save the `number-of-interaction-left` in our track.
-    for (int ip = 0; ip < 3; ++ip) {
-      double numIALeft           = theTrack->GetNumIALeft(ip);
-      currentTrack.numIALeft[ip] = numIALeft;
-    }
+    boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
+      constexpr int ip                                    = decltype(ic)::value;
+      double numIALeft                                    = theTrack->GetNumIALeft(ip);
+      currentTrack(NumIALeft{}, llama::RecordCoord<ip>{}) = numIALeft;
+    });
 
     if (nextState.IsOnBoundary()) {
       // For now, just count that we hit something.
@@ -120,7 +122,9 @@ __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Sec
 
     // Reset number of interaction left for the winner discrete process.
     // (Will be resampled in the next iteration.)
-    currentTrack.numIALeft[winnerProcessIndex] = -1.0;
+    boost::mp11::mp_with_index<3>(winnerProcessIndex, [&](auto ic) {
+      currentTrack(NumIALeft{}, llama::RecordCoord<decltype(ic)::value>{}) = -1.0;
+    });
 
     soaData.nextInteraction[i] = winnerProcessIndex;
     soaData.gamma_PEmxSec[i] = gammaTrack.GetPEmxSec();
@@ -129,15 +133,15 @@ __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Sec
 }
 
 template <int ProcessIndex>
-__device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, int const soaSlot, Track *particles,
+__device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, int const soaSlot, View particles,
                                  Secondaries secondaries, adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                  ScoringPerVolume *scoringPerVolume)
 {
-  Track &currentTrack = particles[globalSlot];
-  const auto energy   = currentTrack.energy;
-  const auto pos      = currentTrack.pos;
-  const auto dir      = currentTrack.dir;
-  const auto navState = currentTrack.navState;
+  auto &&currentTrack = particles[globalSlot];
+  const auto energy   = currentTrack(Energy{});
+  const auto pos      = currentTrack(Pos{});
+  const auto dir      = currentTrack(Dir{});
+  const auto navState = currentTrack(NavState{});
   const auto volume   = navState.Top();
   const int volumeID  = volume->id();
   // the MCC vector is indexed by the logical volume id
@@ -146,8 +150,9 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
 
   auto survive = [&] { activeQueue->push_back(globalSlot); };
 
-  RanluxppDouble newRNG{currentTrack.rngState.Branch()};
-  G4HepEmRandomEngine rnge{currentTrack.rngState};
+  auto &rngState = currentTrack(RngState{});
+  RanluxppDouble newRNG{rngState.Branch()};
+  G4HepEmRandomEngine rnge{rngState};
 
   if constexpr (ProcessIndex == 0) {
     // Invoke gamma conversion to e-/e+ pairs, if the energy is above the threshold.
@@ -166,21 +171,21 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
     G4HepEmGammaInteractionConversion::SampleDirections(dirPrimary, dirSecondaryEl, dirSecondaryPos, elKinEnergy,
                                                         posKinEnergy, &rnge);
 
-    Track &electron = secondaries.electrons.NextTrack();
-    Track &positron = secondaries.positrons.NextTrack();
+    auto &&electron = secondaries.electrons.NextTrack();
+    auto &&positron = secondaries.positrons.NextTrack();
     atomicAdd(&globalScoring->numElectrons, 1);
     atomicAdd(&globalScoring->numPositrons, 1);
 
     InitAsSecondary(electron, pos, navState);
-    electron.rngState = newRNG;
-    electron.energy   = elKinEnergy;
-    electron.dir.Set(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
+    electron(RngState{}) = newRNG;
+    electron(Energy{})   = elKinEnergy;
+    electron(Dir{}).Set(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
 
     InitAsSecondary(positron, pos, navState);
     // Reuse the RNG state of the dying track.
-    positron.rngState = currentTrack.rngState;
-    positron.energy   = posKinEnergy;
-    positron.dir.Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
+    positron(RngState{}) = currentTrack(RngState{});
+    positron(Energy{})   = posKinEnergy;
+    positron(Dir{}).Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
 
     // The current track is killed by not enqueuing into the next activeQueue.
   } else if constexpr (ProcessIndex == 1) {
@@ -199,14 +204,13 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
     const double energyEl = energy - newEnergyGamma;
     if (energyEl > LowEnergyThreshold) {
       // Create a secondary electron and sample/compute directions.
-      Track &electron = secondaries.electrons.NextTrack();
+      auto &&electron = secondaries.electrons.NextTrack();
       atomicAdd(&globalScoring->numElectrons, 1);
 
       InitAsSecondary(electron, pos, navState);
-      electron.rngState = newRNG;
-      electron.energy   = energyEl;
-      electron.dir      = energy * dir - newEnergyGamma * newDirGamma;
-      electron.dir.Normalize();
+      electron(RngState{}) = newRNG;
+      electron(Energy{})   = energyEl;
+      electron(Dir{})      = (energy * dir - newEnergyGamma * newDirGamma).Normalized();
     } else {
       atomicAdd(&globalScoring->energyDeposit, energyEl);
       atomicAdd(&scoringPerVolume->energyDeposit[volumeID], energyEl);
@@ -214,8 +218,8 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
 
     // Check the new gamma energy and deposit if below threshold.
     if (newEnergyGamma > LowEnergyThreshold) {
-      currentTrack.energy = newEnergyGamma;
-      currentTrack.dir    = newDirGamma;
+      currentTrack(Energy{}) = newEnergyGamma;
+      currentTrack(Dir{})    = newDirGamma;
       survive();
     } else {
       atomicAdd(&globalScoring->energyDeposit, newEnergyGamma);
@@ -233,7 +237,7 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
     const double photoElecE = energy - edep;
     if (photoElecE > theLowEnergyThreshold) {
       // Create a secondary electron and sample directions.
-      Track &electron = secondaries.electrons.NextTrack();
+      auto &&electron = secondaries.electrons.NextTrack();
       atomicAdd(&globalScoring->numElectrons, 1);
 
       double dirGamma[] = {dir.x(), dir.y(), dir.z()};
@@ -241,9 +245,9 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
       G4HepEmGammaInteractionPhotoelectric::SamplePhotoElectronDirection(photoElecE, dirGamma, dirPhotoElec, &rnge);
 
       InitAsSecondary(electron, pos, navState);
-      electron.rngState = newRNG;
-      electron.energy   = photoElecE;
-      electron.dir.Set(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
+      electron(RngState{}) = newRNG;
+      electron(Energy{})   = photoElecE;
+      electron(Dir{}).Set(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
     } else {
       edep = energy;
     }
@@ -252,21 +256,21 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
   }
 }
 
-__global__ void PairCreation(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void PairCreation(View particles, const adept::MParray *active, Secondaries secondaries,
                              adept::MParray *activeQueue, GlobalScoring *globalScoring,
                              ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
   InteractionLoop<0>(&GammaInteraction<0>, active, soaData, particles, secondaries, activeQueue, globalScoring,
                      scoringPerVolume);
 }
-__global__ void ComptonScattering(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void ComptonScattering(View particles, const adept::MParray *active, Secondaries secondaries,
                                   adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
   InteractionLoop<1>(&GammaInteraction<1>, active, soaData, particles, secondaries, activeQueue, globalScoring,
                      scoringPerVolume);
 }
-__global__ void PhotoelectricEffect(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void PhotoelectricEffect(View particles, const adept::MParray *active, Secondaries secondaries,
                                     adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                     ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {

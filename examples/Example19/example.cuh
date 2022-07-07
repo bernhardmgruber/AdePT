@@ -6,6 +6,7 @@
 
 #include "example.h"
 
+#include "llama.hpp"
 #include <AdePT/MParray.h>
 #include <CopCore/SystemOfUnits.h>
 #include <CopCore/Ranluxpp.h>
@@ -23,38 +24,41 @@
 
 constexpr int ThreadsPerBlock = 256;
 
+struct RngState {};
+struct Energy {};
+struct NumIALeft {};
+struct InitialRange {};
+struct DynamicRangeFactor {};
+struct TlimitMin {};
+struct Pos {};
+struct Dir {};
+struct NavState {};
+
 // A data structure to represent a particle track. The particle type is implicit
 // by the queue and not stored in memory.
-struct Track {
-  using Precision = vecgeom::Precision;
-  RanluxppDouble rngState;
-  double energy;
-  double numIALeft[3];
-  double initialRange;
-  double dynamicRangeFactor;
-  double tlimitMin;
+using Track = llama::Record<
+    llama::Field<RngState, RanluxppDouble>, llama::Field<Energy, double>, llama::Field<NumIALeft, double[3]>,
+    llama::Field<InitialRange, double>, llama::Field<DynamicRangeFactor, double>, llama::Field<TlimitMin, double>,
+    llama::Field<Pos, vecgeom::Vector3D<vecgeom::Precision>>, llama::Field<Dir, vecgeom::Vector3D<vecgeom::Precision>>,
+    llama::Field<NavState, vecgeom::NavStateIndex>>;
 
-  vecgeom::Vector3D<Precision> pos;
-  vecgeom::Vector3D<Precision> dir;
-  vecgeom::NavStateIndex navState;
-};
-
-__host__ __device__ inline void InitAsSecondary(Track &track, const vecgeom::Vector3D<Precision> &parentPos,
+template <typename SecondayTrack>
+__host__ __device__ inline void InitAsSecondary(SecondayTrack &&track, const vecgeom::Vector3D<Precision> &parentPos,
                                                 const vecgeom::NavStateIndex &parentNavState)
 {
   // The caller is responsible to branch a new RNG state and to set the energy.
-  track.numIALeft[0] = -1.0;
-  track.numIALeft[1] = -1.0;
-  track.numIALeft[2] = -1.0;
+  track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
+  track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
+  track(NumIALeft{}, llama::RecordCoord<2>{}) = -1.0;
 
-  track.initialRange       = -1.0;
-  track.dynamicRangeFactor = -1.0;
-  track.tlimitMin          = -1.0;
+  track(InitialRange{})       = -1.0;
+  track(DynamicRangeFactor{}) = -1.0;
+  track(TlimitMin{})          = -1.0;
 
   // A secondary inherits the position of its parent; the caller is responsible
   // to update the directions.
-  track.pos      = parentPos;
-  track.navState = parentNavState;
+  track(Pos{})      = parentPos;
+  track(NavState{}) = parentNavState;
 }
 
 // Struct for communication between kernels
@@ -148,19 +152,31 @@ public:
   }
 };
 
+using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
+// using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
+// using Mapping  = llama::mapping::AlignedSingleBlobSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
+// using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
+// using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track, 16>;
+// using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track, 32>;
+// using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track, 64>;
+// using Mapping  = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>,
+// unsigned long long, true>;
+using BlobType = std::byte *;
+using View     = llama::View<Mapping, BlobType>;
+
 // A bundle of pointers to generate particles of an implicit type.
 class ParticleGenerator {
-  Track *fTracks;
+  View fTracks;
   SlotManager *fSlotManager;
   adept::MParray *fActiveQueue;
 
 public:
-  __host__ __device__ ParticleGenerator(Track *tracks, SlotManager *slotManager, adept::MParray *activeQueue)
+  __host__ __device__ ParticleGenerator(View tracks, SlotManager *slotManager, adept::MParray *activeQueue)
       : fTracks(tracks), fSlotManager(slotManager), fActiveQueue(activeQueue)
   {
   }
 
-  __host__ __device__ Track &NextTrack()
+  __host__ __device__ decltype(auto) NextTrack()
   {
     int slot = fSlotManager->NextSlot();
     if (slot == -1) {
@@ -179,14 +195,14 @@ struct Secondaries {
 };
 
 // Kernels in different TUs.
-__global__ void TransportElectrons(Track *electrons, const adept::MParray *active, Secondaries secondaries,
+__global__ void TransportElectrons(View electrons, const adept::MParray *active, Secondaries secondaries,
                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                    ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void TransportPositrons(Track *positrons, const adept::MParray *active, Secondaries secondaries,
+__global__ void TransportPositrons(View positrons, const adept::MParray *active, Secondaries secondaries,
                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                    ScoringPerVolume *scoringPerVolume, SOAData const soaData);
 
-__global__ void TransportGammas(Track *gammas, const adept::MParray *active, Secondaries secondaries,
+__global__ void TransportGammas(View gammas, const adept::MParray *active, Secondaries secondaries,
                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                 ScoringPerVolume *scoringPerVolume, SOAData const soaData);
 
@@ -257,30 +273,30 @@ __device__ void InteractionLoop(Func interactionFunction, adept::MParray const *
   assert(particlesDone == todoCounter);
 }
 
-__global__ void IonizationEl(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void IonizationEl(View particles, const adept::MParray *active, Secondaries secondaries,
                              adept::MParray *activeQueue, GlobalScoring *globalScoring,
                              ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void BremsstrahlungEl(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void BremsstrahlungEl(View particles, const adept::MParray *active, Secondaries secondaries,
                                  adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                  ScoringPerVolume *scoringPerVolume, SOAData const soaData);
 
-__global__ void IonizationPos(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void IonizationPos(View particles, const adept::MParray *active, Secondaries secondaries,
                               adept::MParray *activeQueue, GlobalScoring *globalScoring,
                               ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void BremsstrahlungPos(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void BremsstrahlungPos(View particles, const adept::MParray *active, Secondaries secondaries,
                                   adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void AnnihilationPos(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void AnnihilationPos(View particles, const adept::MParray *active, Secondaries secondaries,
                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                 ScoringPerVolume *scoringPerVolume, SOAData const soaData);
 
-__global__ void PairCreation(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void PairCreation(View particles, const adept::MParray *active, Secondaries secondaries,
                              adept::MParray *activeQueue, GlobalScoring *globalScoring,
                              ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void ComptonScattering(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void ComptonScattering(View particles, const adept::MParray *active, Secondaries secondaries,
                                   adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void PhotoelectricEffect(Track *particles, const adept::MParray *active, Secondaries secondaries,
+__global__ void PhotoelectricEffect(View particles, const adept::MParray *active, Secondaries secondaries,
                                     adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                     ScoringPerVolume *scoringPerVolume, SOAData const soaData);
 

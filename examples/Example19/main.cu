@@ -75,7 +75,7 @@ struct ParticleQueues {
 };
 
 struct ParticleType {
-  Track *tracks;
+  View tracks;
   SlotManager *slotManager;
   ParticleQueues queues;
   cudaStream_t stream;
@@ -109,32 +109,32 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
                               bool rotatingParticleGun)
 {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numEvents; i += blockDim.x * gridDim.x) {
-    Track &track = generator.NextTrack();
+    auto &&track = generator.NextTrack();
 
-    track.rngState.SetSeed(startEvent + i);
-    track.energy       = energy;
-    track.numIALeft[0] = -1.0;
-    track.numIALeft[1] = -1.0;
-    track.numIALeft[2] = -1.0;
+    track(RngState{}).SetSeed(startEvent + i);
+    track(Energy{})                             = energy;
+    track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
+    track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
+    track(NumIALeft{}, llama::RecordCoord<2>{}) = -1.0;
 
-    track.initialRange       = -1.0;
-    track.dynamicRangeFactor = -1.0;
-    track.tlimitMin          = -1.0;
+    track(InitialRange{})       = -1.0;
+    track(DynamicRangeFactor{}) = -1.0;
+    track(TlimitMin{})          = -1.0;
 
-    track.pos = {0, 0, 0};
+    track(Pos{}) = {0, 0, 0};
     if (rotatingParticleGun) {
       // Generate particles flat in phi and in eta between -5 and 5. We'll lose the far forwards ones, so no need to
       // simulate.
-      const double phi = 2. * M_PI * track.rngState.Rndm();
-      const double eta = -5. + 10. * track.rngState.Rndm();
-      track.dir.x()    = static_cast<vecgeom::Precision>(cos(phi) / cosh(eta));
-      track.dir.y()    = static_cast<vecgeom::Precision>(sin(phi) / cosh(eta));
-      track.dir.z()    = static_cast<vecgeom::Precision>(tanh(eta));
+      const double phi = 2. * M_PI * track(RngState{}).Rndm();
+      const double eta = -5. + 10. * track(RngState{}).Rndm();
+      track(Dir{}).x() = static_cast<vecgeom::Precision>(cos(phi) / cosh(eta));
+      track(Dir{}).y() = static_cast<vecgeom::Precision>(sin(phi) / cosh(eta));
+      track(Dir{}).z() = static_cast<vecgeom::Precision>(tanh(eta));
     } else {
-      track.dir = {1.0, 0, 0};
+      track(Dir{}) = {1.0, 0, 0};
     }
-    track.navState.Clear();
-    BVHNavigator::LocatePointIn(world, track.pos, track.navState, true);
+    track(NavState{}).Clear();
+    BVHNavigator::LocatePointIn(world, track(Pos{}), track(NavState{}), true);
 
     atomicAdd(&globalScoring->numElectrons, 1);
   }
@@ -159,6 +159,18 @@ __global__ void ClearQueue(adept::MParray *queue)
   queue->clear();
 }
 
+template <typename View>
+void reportHits(View tracks, cudaStream_t stream)
+{
+  if constexpr (llama::mapping::isTrace<typename View::Mapping>) {
+    std::byte *hitsArrayBlob = tracks.storageBlobs.back();
+    typename View::Mapping::FieldHitsArray hits;
+    COPCORE_CUDA_CHECK(cudaMemcpy(&hits, hitsArrayBlob, sizeof(hits), cudaMemcpyDeviceToHost));
+    tracks.mapping().printFieldHits(hits);
+    COPCORE_CUDA_CHECK(cudaMemsetAsync(hitsArrayBlob, 0, sizeof(hits), stream));
+  }
+}
+
 void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
             ScoringPerVolume *scoringPerVolume_host, GlobalScoring *globalScoring_host, int numVolumes, int numPlaced,
             G4HepEmState *state, bool rotatingParticleGun)
@@ -178,7 +190,7 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
 
   // Capacity of the different containers aka the maximum number of particles.
   // Use 1/5 of GPU memory for each of e+/e-/gammas, leaving 2/5 for the rest.
-  const size_t Capacity = (deviceProp.totalGlobalMem / sizeof(Track) / 5);
+  const size_t Capacity = (deviceProp.totalGlobalMem / llama::sizeOf<Track> / 5.);
 
   std::cout << "INFO: capacity of containers set to " << Capacity << std::endl;
   if (batch == -1) {
@@ -194,19 +206,23 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
     std::cout << "INFO: running with magnetic field OFF" << std::endl;
   }
 
+  Mapping mapping(llama::ArrayExtentsDynamic<std::size_t, 1>{Capacity}); // FIXME(bgruber): might be too small on V100
+
   // Allocate structures to manage tracks of an implicit type:
   //  * memory to hold the actual Track elements,
   //  * objects to manage slots inside the memory,
   //  * queues of slots to remember active particle and those needing relocation,
   //  * a stream and an event for synchronization of kernels.
-  const size_t TracksSize  = sizeof(Track) * Capacity;
   const size_t ManagerSize = sizeof(SlotManager);
   const size_t QueueSize   = adept::MParray::SizeOfInstance(Capacity);
 
   ParticleType particles[ParticleType::NumParticleTypes];
   for (int i = 0; i < ParticleType::NumParticleTypes; i++) {
-    COPCORE_CUDA_CHECK(cudaMalloc(&particles[i].tracks, TracksSize));
-
+    particles[i].tracks = llama::allocViewUninitialized(mapping, [](auto alignment, auto size) {
+      std::byte *p = nullptr;
+      COPCORE_CUDA_CHECK(cudaMalloc(&p, size));
+      return p;
+    });
     COPCORE_CUDA_CHECK(cudaMalloc(&particles[i].slotManager, ManagerSize));
 
     COPCORE_CUDA_CHECK(cudaMalloc(&particles[i].queues.currentlyActive, QueueSize));
@@ -497,7 +513,8 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
     COPCORE_CUDA_CHECK(cudaStreamDestroy(interactionStreams[i]));
 
   for (int i = 0; i < ParticleType::NumParticleTypes; i++) {
-    COPCORE_CUDA_CHECK(cudaFree(particles[i].tracks));
+    for (auto *p : particles[i].tracks.storageBlobs)
+      COPCORE_CUDA_CHECK(cudaFree(p));
     COPCORE_CUDA_CHECK(cudaFree(particles[i].slotManager));
 
     COPCORE_CUDA_CHECK(cudaFree(particles[i].queues.currentlyActive));

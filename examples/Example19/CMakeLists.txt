@@ -18,6 +18,8 @@ else()
   return()
 endif()
 
+find_package(Boost REQUIRED)
+
 add_executable(${TargetName}
   main.cpp
   main.cu
@@ -34,7 +36,10 @@ target_link_libraries(${TargetName}
     G4HepEm::g4HepEmData
     G4HepEm::g4HepEmInit
     G4HepEm::g4HepEmRun
-    CUDA::cudart)
+    CUDA::cudart
+    Boost::headers)
+target_compile_options(${TargetName} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+
 
 set_target_properties(${TargetName} PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
