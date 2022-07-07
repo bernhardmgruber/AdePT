@@ -162,12 +162,12 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
     atomicAdd(&globalScoring->numElectrons, 1);
     atomicAdd(&globalScoring->numPositrons, 1);
 
-    electron.InitAsSecondary(/*parent=*/currentTrack);
+    InitAsSecondary(electron, currentTrack.pos, currentTrack.navState);
     electron.rngState = newRNG;
     electron.energy   = elKinEnergy;
     electron.dir.Set(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
 
-    positron.InitAsSecondary(/*parent=*/currentTrack);
+    InitAsSecondary(positron, currentTrack.pos, currentTrack.navState);
     // Reuse the RNG state of the dying track.
     positron.rngState = currentTrack.rngState;
     positron.energy   = posKinEnergy;
@@ -193,7 +193,7 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
       Track &electron = secondaries.electrons.NextTrack();
       atomicAdd(&globalScoring->numElectrons, 1);
 
-      electron.InitAsSecondary(/*parent=*/currentTrack);
+      InitAsSecondary(electron, currentTrack.pos, currentTrack.navState);
       electron.rngState = newRNG;
       electron.energy   = energyEl;
       electron.dir      = energy * currentTrack.dir - newEnergyGamma * newDirGamma;
@@ -231,7 +231,7 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
       double dirPhotoElec[3];
       G4HepEmGammaInteractionPhotoelectric::SamplePhotoElectronDirection(photoElecE, dirGamma, dirPhotoElec, &rnge);
 
-      electron.InitAsSecondary(/*parent=*/currentTrack);
+      InitAsSecondary(electron, currentTrack.pos, currentTrack.navState);
       electron.rngState = newRNG;
       electron.energy   = photoElecE;
       electron.dir.Set(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
