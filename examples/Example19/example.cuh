@@ -12,10 +12,14 @@
 
 #include <G4HepEmData.hh>
 #include <G4HepEmParameters.hh>
-#include <G4HepEmRandomEngine.hh>
+#include "G4HepEmMacros.hh"
+#include "G4HepEmMath.hh"
+#include "G4HepEmConstants.hh"
 
 #include <VecGeom/base/Vector3D.h>
 #include <VecGeom/navigation/NavStateIndex.h>
+
+#include <cmath>
 
 constexpr int ThreadsPerBlock = 256;
 
@@ -60,24 +64,73 @@ struct SOAData {
   double *gamma_PEmxSec = nullptr;
 };
 
-class RanluxppDoubleEngine : public G4HepEmRandomEngine {
-  // Wrapper functions to call into RanluxppDouble.
-  static __host__ __device__ double FlatWrapper(void *object)
-  {
-    return ((RanluxppDouble *)object)->Rndm();
-  }
-  static __host__ __device__ void FlatArrayWrapper(void *object, const int size, double *vect)
+// we provide our own
+#define G4HepEmRandomEngine_HH
+
+struct G4HepEmRandomEngine {
+public:
+  G4HepEmHostDevice G4HepEmRandomEngine(RanluxppDouble &ranlux) : ranlux(&ranlux), fIsGauss(false), fGauss(0.) {}
+
+  G4HepEmHostDevice double flat() { return ranlux->Rndm(); }
+
+  G4HepEmHostDevice void flatArray(const int size, double *vect)
   {
     for (int i = 0; i < size; i++) {
-      vect[i] = ((RanluxppDouble *)object)->Rndm();
+      vect[i] = ranlux->Rndm();
     }
   }
 
-public:
-  __host__ __device__ RanluxppDoubleEngine(RanluxppDouble *engine)
-      : G4HepEmRandomEngine(/*object=*/engine, &FlatWrapper, &FlatArrayWrapper)
+  G4HepEmHostDevice double Gauss(const double mean, const double stDev)
   {
+    if (fIsGauss) {
+      fIsGauss = false;
+      return fGauss * stDev + mean;
+    }
+    double rnd[2];
+    double r, v1, v2;
+    do {
+      flatArray(2, rnd);
+      v1 = 2. * rnd[0] - 1.;
+      v2 = 2. * rnd[1] - 1.;
+      r  = v1 * v1 + v2 * v2;
+    } while (r > 1.);
+    const double fac = std::sqrt(-2. * G4HepEmLog(r) / r);
+    fGauss           = v1 * fac;
+    fIsGauss         = true;
+    return v2 * fac * stDev + mean;
   }
+
+  G4HepEmHostDevice void DiscardGauss() { fIsGauss = false; }
+
+  G4HepEmHostDevice int Poisson(double mean)
+  {
+    const int border   = 16;
+    const double limit = 2.E+9;
+
+    int number = 0;
+    if (mean <= border) {
+      const double position = flat();
+      double poissonValue   = G4HepEmExp(-mean);
+      double poissonSum     = poissonValue;
+      while (poissonSum <= position) {
+        ++number;
+        poissonValue *= mean / number;
+        poissonSum += poissonValue;
+      }
+      return number;
+    } // the case of mean <= 16
+    //
+    double rnd[2];
+    flatArray(2, rnd);
+    const double t = std::sqrt(-2. * G4HepEmLog(rnd[0])) * std::cos(k2Pi * rnd[1]);
+    double value   = mean + t * std::sqrt(mean) + 0.5;
+    return value < 0. ? 0 : value >= limit ? static_cast<int>(limit) : static_cast<int>(value);
+  }
+
+private:
+  RanluxppDouble *ranlux;
+  bool fIsGauss;
+  double fGauss;
 };
 
 // A data structure to manage slots in the track storage.
