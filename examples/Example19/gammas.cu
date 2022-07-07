@@ -32,6 +32,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot      = (*active)[i];
     auto &&currentTrack = gammas[slot];
+    auto &&rngRef       = currentTrack(RngState{});
     const auto energy   = currentTrack(Energy{});
     auto pos            = currentTrack(Pos{});
     const auto dir      = currentTrack(Dir{});
@@ -62,7 +63,7 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
       constexpr int ip = decltype(ic)::value;
       double numIALeft = currentTrack(NumIALeft{}, llama::RecordCoord<ip>{});
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        numIALeft = -std::log(ranlux::NextRandomFloat(rngRef));
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     });
@@ -138,6 +139,7 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
                                  ScoringPerVolume *scoringPerVolume)
 {
   auto &&currentTrack = particles[globalSlot];
+  auto &&rngRef       = currentTrack(RngState{});
   const auto energy   = currentTrack(Energy{});
   const auto pos      = currentTrack(Pos{});
   const auto dir      = currentTrack(Dir{});
@@ -150,9 +152,8 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
 
   auto survive = [&] { activeQueue->push_back(globalSlot); };
 
-  auto &rngState = currentTrack(RngState{});
-  RanluxppDouble newRNG{rngState.Branch()};
-  G4HepEmRandomEngine rnge{rngState};
+  auto newRNG = ranlux::Branch(rngRef);
+  G4HepEmRandomEngine rnge(rngRef);
 
   if constexpr (ProcessIndex == 0) {
     // Invoke gamma conversion to e-/e+ pairs, if the energy is above the threshold.
@@ -183,7 +184,7 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
 
     InitAsSecondary(positron, pos, navState);
     // Reuse the RNG state of the dying track.
-    positron(RngState{}) = currentTrack(RngState{});
+    positron(RngState{}) = rngRef;
     positron(Energy{})   = posKinEnergy;
     positron(Dir{}).Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
 

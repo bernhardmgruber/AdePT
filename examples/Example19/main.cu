@@ -111,7 +111,7 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numEvents; i += blockDim.x * gridDim.x) {
     auto &&track = generator.NextTrack();
 
-    track(RngState{}).SetSeed(startEvent + i);
+    ranlux::SetSeed(track(RngState{}), startEvent + i);
     track(Energy{})                             = energy;
     track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
     track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
@@ -125,8 +125,8 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
     if (rotatingParticleGun) {
       // Generate particles flat in phi and in eta between -5 and 5. We'll lose the far forwards ones, so no need to
       // simulate.
-      const double phi = 2. * M_PI * track(RngState{}).Rndm();
-      const double eta = -5. + 10. * track(RngState{}).Rndm();
+      const double phi = 2. * M_PI * ranlux::NextRandomFloat(track(RngState{}));
+      const double eta = -5. + 10. * ranlux::NextRandomFloat(track(RngState{}));
       track(Dir{}).x() = static_cast<vecgeom::Precision>(cos(phi) / cosh(eta));
       track(Dir{}).y() = static_cast<vecgeom::Precision>(sin(phi) / cosh(eta));
       track(Dir{}).z() = static_cast<vecgeom::Precision>(tanh(eta));
