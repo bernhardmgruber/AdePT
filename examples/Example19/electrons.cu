@@ -46,6 +46,9 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
   // The shared memory handles the access pattern to the RNG better than global memory. And we don't have enough
   // registers to keep it local. This is a byte array, because RanluxppDouble has a ctor that we do not want to run.
   __shared__ std::byte rngSM[ThreadsPerBlock * sizeof(RanluxppDouble)];
+  __shared__ std::byte elTrackSM[ThreadsPerBlock * sizeof(G4HepEmElectronTrack)];
+  static_assert(sizeof(RanluxppDouble) == 80);
+  static_assert(sizeof(G4HepEmElectronTrack) == 328);
 
   int activeSize = active->size();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
@@ -62,6 +65,7 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
     const int theMCIndex = MCIndex[lvolID];
 
     auto &rngState = *reinterpret_cast<RanluxppDouble *>(rngSM + threadIdx.x * sizeof(RanluxppDouble));
+//    RanluxppDouble rngState;
     rngState       = currentTrack.rngState;
 
     auto survive = [&](bool push = true) {
@@ -77,7 +81,7 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
     soaData.nextInteraction[i] = -1;
 
     // Init a track with the needed data to call into G4HepEm.
-    G4HepEmElectronTrack elTrack;
+    G4HepEmElectronTrack& elTrack= *reinterpret_cast<G4HepEmElectronTrack *>(elTrackSM + threadIdx.x * sizeof(G4HepEmElectronTrack));
     G4HepEmTrack *theTrack = elTrack.GetTrack();
     theTrack->SetEKin(energy);
     theTrack->SetMCIndex(theMCIndex);

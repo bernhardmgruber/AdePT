@@ -21,7 +21,7 @@
 
 #include <cmath>
 
-constexpr int ThreadsPerBlock = 256;
+constexpr int ThreadsPerBlock = 128 - 32;
 
 // A data structure to represent a particle track. The particle type is implicit
 // by the queue and not stored in memory.
