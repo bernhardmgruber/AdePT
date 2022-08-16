@@ -32,7 +32,7 @@ template <bool IsElectron>
 static __device__ __forceinline__ void TransportElectrons(Track *electrons, const adept::MParray *active,
                                                           Secondaries &secondaries, adept::MParray *activeQueue,
                                                           GlobalScoring *globalScoring,
-                                                          ScoringPerVolume *scoringPerVolume, SOAData soaData)
+                                                          ScoringPerVolume *scoringPerVolume, SOAData soaData, RecordedTime* timings)
 {
 #ifdef VECGEOM_FLOAT_PRECISION
   const Precision kPush = 10 * vecgeom::kTolerance;
@@ -47,8 +47,36 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
   // registers to keep it local. This is a byte array, because RanluxppDouble has a ctor that we do not want to run.
   __shared__ std::byte rngSM[ThreadsPerBlock * sizeof(RanluxppDouble)];
 
+  decltype(clock()) last;
+  int timeIdx = 0;
+
   int activeSize = active->size();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
+    if (IsElectron && i == 0) last = clock();
+    auto print_time = [&](const char *name) {
+      if (IsElectron && i == 0) {
+        const auto now = clock();
+//        printf("%30s %lu %lu\n", name, now, now - last);
+        auto& t = timings[timeIdx++];
+        auto* dst = t.name;
+        while (*name != 0 && dst < t.name + 8)
+          *dst++ = *name++;
+        while (dst < t.name + 8)
+          *dst++ = 0;
+        t.clockdiff = now - last;
+        last = now;
+      }
+    };
+    print_time("begin1");
+    print_time("begin2");
+    print_time("begin3");
+
+    struct A {
+      __device__ ~A() { print_time("end"); }
+      int &i;
+      decltype(print_time) &print_time;
+    } guard{i, print_time};
+
     const int globalSlot = (*active)[i];
     Track &currentTrack  = electrons[globalSlot];
     auto energy          = currentTrack.energy;
@@ -63,6 +91,9 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
 
     auto &rngState = *reinterpret_cast<RanluxppDouble *>(rngSM + threadIdx.x * sizeof(RanluxppDouble));
     rngState       = currentTrack.rngState;
+
+    print_time("load");
+    print_time("load2");
 
     auto survive = [&](bool push = true) {
       currentTrack.rngState = rngState;
@@ -94,12 +125,16 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
     // divergence because the RNG state doesn't need to be advanced later.
     RanluxppDouble newRNG(rngState.BranchNoAdvance());
 
+    print_time("G4Hep_RNG_setup");
+
     // Compute safety, needed for MSC step limit.
     double safety = 0;
     if (!navState.IsOnBoundary()) {
       safety = BVHNavigator::ComputeSafety(pos, navState);
     }
     theTrack->SetSafety(safety);
+
+    print_time("ComputeSafety");
 
     G4HepEmRandomEngine rnge(rngState);
 
@@ -112,9 +147,13 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
       theTrack->SetNumIALeft(numIALeft, ip);
     }
 
+    print_time("numIALeft");
+
     // Call G4HepEm to compute the physics step limit.
     // G4HepEmElectronManager::HowFar(&g4HepEmData, &g4HepEmPars, &elTrack, &rnge);
     G4HepEmElectronManager::HowFarToDiscreteInteraction(&g4HepEmData, &g4HepEmPars, &elTrack);
+
+    print_time("HowFarToDiscreteInteraction");
 
     bool restrictedPhysicalStepLength = false;
     if (BzFieldValue != 0) {
@@ -137,7 +176,11 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
       }
     }
 
+    print_time("ComputeSafeLength");
+
     G4HepEmElectronManager::HowFarToMSC(&g4HepEmData, &g4HepEmPars, &elTrack, &rnge);
+
+    print_time("HowFarToMSC");
 
     // Remember MSC values for the next step(s).
     currentTrack.initialRange       = mscData->fInitialRange;
@@ -154,6 +197,8 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
     int winnerProcessIndex = theTrack->GetWinnerProcessIndex();
     // Leave the range and MFP inside the G4HepEmTrack. If we split kernels, we
     // also need to carry them over!
+
+    print_time("GetWinnerProcessIndex");
 
     // Check if there's a volume boundary in between.
     bool propagated = true;
@@ -178,8 +223,12 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
     theTrack->SetGStepLength(geometryStepLength);
     theTrack->SetOnBoundary(nextState.IsOnBoundary());
 
+    print_time("ComputeStepAndNextVolume");
+
     // Apply continuous effects.
     bool stopped = G4HepEmElectronManager::PerformContinuous(&g4HepEmData, &g4HepEmPars, &elTrack, &rnge);
+
+    print_time("PerformContinuous");
 
     // Collect the direction change and displacement by MSC.
     const double *direction = theTrack->GetDirection();
@@ -218,6 +267,8 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
       }
     }
 
+    print_time("MSC_displacement");
+
     // Collect the charged step length (might be changed by MSC).
     atomicAdd(&globalScoring->chargedSteps, 1);
     atomicAdd(&scoringPerVolume->chargedTrackLength[volumeID], elTrack.GetPStepLength());
@@ -227,12 +278,15 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
     double energyDeposit = theTrack->GetEnergyDeposit();
     atomicAdd(&globalScoring->energyDeposit, energyDeposit);
     atomicAdd(&scoringPerVolume->energyDeposit[volumeID], energyDeposit);
+    print_time("scoring");
 
     // Save the `number-of-interaction-left` in our track.
     for (int ip = 0; ip < 3; ++ip) {
       double numIALeft           = theTrack->GetNumIALeft(ip);
       currentTrack.numIALeft[ip] = numIALeft;
     }
+
+    print_time("numIALeft");
 
     if (stopped) {
       if (!IsElectron) {
@@ -263,6 +317,7 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
       // Particles are killed by not enqueuing them into the new activeQueue.
       continue;
     }
+    print_time("positron_2gamma_decay");
 
     if (nextState.IsOnBoundary()) {
       // For now, just count that we hit something.
@@ -292,12 +347,15 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
     // (Will be resampled in the next iteration.)
     currentTrack.numIALeft[winnerProcessIndex] = -1.0;
 
+    print_time("winnerProcessIndex");
+
     // Check if a delta interaction happens instead of the real discrete process.
     if (G4HepEmElectronManager::CheckDelta(&g4HepEmData, theTrack, rngState.Rndm())) {
       // A delta interaction happened, move on.
       survive();
       continue;
     }
+    print_time("CheckDelta");
 
     soaData.nextInteraction[i] = winnerProcessIndex;
 
@@ -308,17 +366,17 @@ static __device__ __forceinline__ void TransportElectrons(Track *electrons, cons
 // Instantiate kernels for electrons and positrons.
 __global__ void TransportElectrons(Track *electrons, const adept::MParray *active, Secondaries secondaries,
                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData soaData)
+                                   ScoringPerVolume *scoringPerVolume, SOAData soaData, RecordedTime* timings)
 {
   TransportElectrons</*IsElectron*/ true>(electrons, active, secondaries, activeQueue, globalScoring, scoringPerVolume,
-                                          soaData);
+                                          soaData, timings);
 }
 __global__ void TransportPositrons(Track *positrons, const adept::MParray *active, Secondaries secondaries,
                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData soaData)
+                                   ScoringPerVolume *scoringPerVolume, SOAData soaData, RecordedTime* timings)
 {
   TransportElectrons</*IsElectron*/ false>(positrons, active, secondaries, activeQueue, globalScoring, scoringPerVolume,
-                                           soaData);
+                                           soaData, timings);
 }
 
 template <bool IsElectron, int ProcessIndex>

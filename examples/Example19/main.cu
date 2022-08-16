@@ -31,6 +31,7 @@
 
 #include <iostream>
 #include <iomanip>
+#include <string_view>
 #include <stdio.h>
 
 __constant__ __device__ struct G4HepEmParameters g4HepEmPars;
@@ -312,6 +313,11 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
     int loopingNo         = 0;
     int previousElectrons = -1, previousPositrons = -1;
 
+    constexpr auto timing_count = 30;
+    RecordedTime *timings;
+    COPCORE_CUDA_CHECK(cudaMalloc(&timings, sizeof(RecordedTime) * timing_count));
+    COPCORE_CUDA_CHECK(cudaMemset(timings, 0, sizeof(RecordedTime) * timing_count));
+
     do {
       Secondaries secondaries = {
           .electrons = {electrons.tracks, electrons.slotManager, electrons.queues.nextActive},
@@ -327,10 +333,19 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
 
         TransportElectrons<<<transportBlocks, ThreadsPerBlock, 0, electrons.stream>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
-            scoringPerVolume, electrons.soaData);
+            scoringPerVolume, electrons.soaData, timings);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(electrons.event, electrons.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[0], electrons.event, 0));
+
+        {
+          std::array<RecordedTime, timing_count> timings_host{};
+          COPCORE_CUDA_CHECK(
+              cudaMemcpy(timings_host.data(), timings, sizeof(RecordedTime) * timing_count, cudaMemcpyDeviceToHost));
+          std::cout << "Electrons in flight: " << numElectrons << '\n';
+          for (int i = 0; i < timing_count; i++)
+            std::cout << std::string_view{timings_host[i].name, 8} << " " << timings_host[i].clockdiff << '\n';
+        }
 
         IonizationEl<<<transportBlocks, ThreadsPerBlock, 0, interactionStreams[0]>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
@@ -353,7 +368,7 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
 
         TransportPositrons<<<transportBlocks, ThreadsPerBlock, 0, positrons.stream>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
-            scoringPerVolume, positrons.soaData);
+            scoringPerVolume, positrons.soaData, nullptr);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(positrons.event, positrons.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[1], positrons.event, 0));

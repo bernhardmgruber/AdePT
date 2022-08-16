@@ -178,13 +178,18 @@ struct Secondaries {
   ParticleGenerator gammas;
 };
 
+struct RecordedTime {
+  char name[8];
+  int clockdiff;
+};
+
 // Kernels in different TUs.
 __global__ void TransportElectrons(Track *electrons, const adept::MParray *active, Secondaries secondaries,
                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData, RecordedTime* timings);
 __global__ void TransportPositrons(Track *positrons, const adept::MParray *active, Secondaries secondaries,
                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData, RecordedTime* timings);
 
 __global__ void TransportGammas(Track *gammas, const adept::MParray *active, Secondaries secondaries,
                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
