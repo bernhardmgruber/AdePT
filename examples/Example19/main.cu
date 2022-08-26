@@ -329,10 +329,10 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         COPCORE_CUDA_CHECK(cudaEventRecord(electrons.event, electrons.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[0], electrons.event, 0));
 
-        IonizationEl<<<transportBlocks, ThreadsPerBlock, 0, interactionStreams[0]>>>(
+        IonizationEl<<<32, ThreadsPerBlock, 0, interactionStreams[0]>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
             scoringPerVolume, electrons.soaData);
-        BremsstrahlungEl<<<transportBlocks, ThreadsPerBlock, 0, electrons.stream>>>(
+        BremsstrahlungEl<<<128, ThreadsPerBlock, 0, electrons.stream>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
             scoringPerVolume, electrons.soaData);
 
@@ -356,13 +356,13 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[1], positrons.event, 0));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[2], positrons.event, 0));
 
-        IonizationPos<<<transportBlocks, ThreadsPerBlock, 0, interactionStreams[1]>>>(
+        IonizationPos<<<32, ThreadsPerBlock, 0, interactionStreams[1]>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume, positrons.soaData);
-        BremsstrahlungPos<<<transportBlocks, ThreadsPerBlock, 0, positrons.stream>>>(
+        BremsstrahlungPos<<<128, ThreadsPerBlock, 0, positrons.stream>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume, positrons.soaData);
-        AnnihilationPos<<<transportBlocks, ThreadsPerBlock, 0, interactionStreams[2]>>>(
+        AnnihilationPos<<<8, ThreadsPerBlock, 0, interactionStreams[2]>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume, positrons.soaData);
 
@@ -389,15 +389,15 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
           COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[i], gammas.event, 0));
         }
         // About 2% of all gammas:
-        PairCreation<<<transportBlocks, ThreadsPerBlock, 0, interactionStreams[0]>>>(
+        PairCreation<<<16, ThreadsPerBlock, 0, interactionStreams[0]>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume, gammas.soaData);
         // About 10% of all gammas:
-        ComptonScattering<<<transportBlocks, ThreadsPerBlock, 0, interactionStreams[1]>>>(
+        ComptonScattering<<<64, ThreadsPerBlock, 0, interactionStreams[1]>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume, gammas.soaData);
         // About 15% of all gammas:
-        PhotoelectricEffect<<<transportBlocks, ThreadsPerBlock, 0, interactionStreams[2]>>>(
+        PhotoelectricEffect<<<64, ThreadsPerBlock, 0, interactionStreams[2]>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume, gammas.soaData);
         for (auto i = 0; i < 3; ++i) {
