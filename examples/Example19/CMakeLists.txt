@@ -20,9 +20,7 @@ endif()
 
 add_executable(${TargetName}
   main.cpp
-  main.cu
-  electrons.cu
-  gammas.cu)
+  main.cu)
 target_link_libraries(${TargetName}
   PRIVATE
     AdePT
@@ -35,6 +33,8 @@ target_link_libraries(${TargetName}
     G4HepEm::g4HepEmInit
     G4HepEm::g4HepEmRun
     CUDA::cudart)
+target_compile_options(${TargetName} PRIVATE -Wall)
+
 
 set_target_properties(${TargetName} PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
