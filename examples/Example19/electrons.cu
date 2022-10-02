@@ -29,9 +29,8 @@
 // applying the continuous effects and maybe a discrete process that could
 // generate secondaries.
 template <bool IsElectron>
-static __device__ __forceinline__ void TransportElectrons(View electrons, const adept::MParray *active,
-                                                          Secondaries &secondaries, adept::MParray *activeQueue,
-                                                          GlobalScoring *globalScoring,
+static __device__ __forceinline__ void TransportElectrons(View electrons, const ParticleCount *electronsCount,
+                                                          Secondaries &secondaries, GlobalScoring *globalScoring,
                                                           ScoringPerVolume *scoringPerVolume, SOAData soaData)
 {
 #ifdef VECGEOM_FLOAT_PRECISION
@@ -47,16 +46,15 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
   // registers to keep it local. This is a byte array, because RanluxppDouble has a ctor that we do not want to run.
   __shared__ std::byte rngSM[ThreadsPerBlock * sizeof(RanluxppDouble)];
 
-  int activeSize = active->size();
+  int activeSize = *electronsCount;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
-    const int globalSlot = (*active)[i];
-    auto &&currentTrack  = electrons[globalSlot];
-    auto energy          = currentTrack(Energy{});
-    auto pos             = currentTrack(Pos{});
-    auto dir             = currentTrack(Dir{});
-    auto navState        = currentTrack(NavState{});
-    const auto volume    = navState.Top();
-    const int volumeID   = volume->id();
+    auto &&currentTrack = electrons[i];
+    auto energy         = currentTrack(Energy{});
+    auto pos            = currentTrack(Pos{});
+    auto dir            = currentTrack(Dir{});
+    auto navState       = currentTrack(NavState{});
+    const auto volume   = navState.Top();
+    const int volumeID  = volume->id();
     // the MCC vector is indexed by the logical volume id
     const int lvolID     = volume->GetLogicalVolume()->id();
     const int theMCIndex = MCIndex[lvolID];
@@ -65,12 +63,25 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
     rngState       = currentTrack(RngState{});
 
     auto survive = [&](bool push = true) {
-      currentTrack(RngState{}) = rngState;
-      currentTrack(Energy{})   = energy;
-      currentTrack(Pos{})      = pos;
-      currentTrack(Dir{})      = dir;
-      currentTrack(NavState{}) = navState;
-      if (push) activeQueue->push_back(globalSlot);
+      auto writeBack = [&](auto &&track) {
+        track(RngState{}) = rngState;
+        track(Energy{})   = energy;
+        track(Pos{})      = pos;
+        track(Dir{})      = dir;
+        track(NavState{}) = navState;
+      };
+      if (push) {
+        // copy track to memory for next iteration
+        auto &&nextTrack = [&] {
+          if constexpr (IsElectron)
+            return secondaries.electrons.NextTrack();
+          else
+            return secondaries.positrons.NextTrack();
+        }();
+        nextTrack = currentTrack;
+        writeBack(nextTrack); // I hope the compiler eliminates the dead stores
+      } else
+        writeBack(currentTrack);
     };
 
     // Signal that this globalSlot doesn't undergo an interaction (yet)
@@ -310,25 +321,23 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
 }
 
 // Instantiate kernels for electrons and positrons.
-__global__ void TransportElectrons(View electrons, const adept::MParray *active, Secondaries secondaries,
-                                   adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData soaData)
+__global__ void TransportElectrons(View electrons, const ParticleCount *electronsCount, Secondaries secondaries,
+                                   GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData soaData)
 {
-  TransportElectrons</*IsElectron*/ true>(electrons, active, secondaries, activeQueue, globalScoring, scoringPerVolume,
+  TransportElectrons</*IsElectron*/ true>(electrons, electronsCount, secondaries, globalScoring, scoringPerVolume,
                                           soaData);
 }
-__global__ void TransportPositrons(View positrons, const adept::MParray *active, Secondaries secondaries,
-                                   adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData soaData)
+__global__ void TransportPositrons(View positrons, const ParticleCount *electronsCount, Secondaries secondaries,
+                                   GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData soaData)
 {
-  TransportElectrons</*IsElectron*/ false>(positrons, active, secondaries, activeQueue, globalScoring, scoringPerVolume,
+  TransportElectrons</*IsElectron*/ false>(positrons, electronsCount, secondaries, globalScoring, scoringPerVolume,
                                            soaData);
 }
 
 template <bool IsElectron, int ProcessIndex>
-__device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaData*/, int const /*soaSlot*/,
-                                    View particles, Secondaries secondaries, adept::MParray *activeQueue,
-                                    GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume)
+__device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaData*/, View particles,
+                                    Secondaries secondaries, GlobalScoring *globalScoring,
+                                    ScoringPerVolume *scoringPerVolume)
 {
   auto &&currentTrack = particles[globalSlot];
   auto energy         = currentTrack(Energy{});
@@ -341,9 +350,15 @@ __device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaD
   const int theMCIndex = MCIndex[lvolID];
 
   auto survive = [&] {
-    currentTrack(Energy{}) = energy;
-    currentTrack(Dir{})    = dir;
-    activeQueue->push_back(globalSlot);
+    auto &&nextTrack = [&] {
+      if constexpr (IsElectron)
+        return secondaries.electrons.NextTrack();
+      else
+        return secondaries.positrons.NextTrack();
+    }();
+    nextTrack           = currentTrack;
+    nextTrack(Energy{}) = energy;
+    nextTrack(Dir{})    = dir;
   };
 
   const double theElCut = g4HepEmData.fTheMatCutData->fMatCutData[theMCIndex].fSecElProdCutE;
@@ -423,39 +438,36 @@ __device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaD
   }
 }
 
-__global__ void IonizationEl(View particles, const adept::MParray *active, Secondaries secondaries,
-                             adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                             ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void IonizationEl(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                             GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
-  InteractionLoop<0>(&ElectronInteraction<true, 0>, active, soaData, particles, secondaries, activeQueue, globalScoring,
+  InteractionLoop<0>(&ElectronInteraction<true, 0>, electronsCount, soaData, particles, secondaries, globalScoring,
                      scoringPerVolume);
 }
-__global__ void BremsstrahlungEl(View particles, const adept::MParray *active, Secondaries secondaries,
-                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                 ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void BremsstrahlungEl(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                 GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                 SOAData const soaData)
 {
-  InteractionLoop<1>(&ElectronInteraction<true, 1>, active, soaData, particles, secondaries, activeQueue, globalScoring,
+  InteractionLoop<1>(&ElectronInteraction<true, 1>, electronsCount, soaData, particles, secondaries, globalScoring,
                      scoringPerVolume);
 }
 
-__global__ void IonizationPos(View particles, const adept::MParray *active, Secondaries secondaries,
-                              adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                              ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void IonizationPos(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                              GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
-  InteractionLoop<0>(&ElectronInteraction<false, 0>, active, soaData, particles, secondaries, activeQueue,
-                     globalScoring, scoringPerVolume);
+  InteractionLoop<0>(&ElectronInteraction<false, 0>, electronsCount, soaData, particles, secondaries, globalScoring,
+                     scoringPerVolume);
 }
-__global__ void BremsstrahlungPos(View particles, const adept::MParray *active, Secondaries secondaries,
-                                  adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                  ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void BremsstrahlungPos(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                  GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                  SOAData const soaData)
 {
-  InteractionLoop<1>(&ElectronInteraction<false, 1>, active, soaData, particles, secondaries, activeQueue,
-                     globalScoring, scoringPerVolume);
+  InteractionLoop<1>(&ElectronInteraction<false, 1>, electronsCount, soaData, particles, secondaries, globalScoring,
+                     scoringPerVolume);
 }
-__global__ void AnnihilationPos(View particles, const adept::MParray *active, Secondaries secondaries,
-                                adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void AnnihilationPos(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
-  InteractionLoop<2>(&ElectronInteraction<false, 2>, active, soaData, particles, secondaries, activeQueue,
-                     globalScoring, scoringPerVolume);
+  InteractionLoop<2>(&ElectronInteraction<false, 2>, electronsCount, soaData, particles, secondaries, globalScoring,
+                     scoringPerVolume);
 }

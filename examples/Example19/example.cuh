@@ -7,7 +7,6 @@
 #include "example.h"
 
 #include "llama.hpp"
-#include <AdePT/MParray.h>
 #include <CopCore/SystemOfUnits.h>
 #include <CopCore/Ranluxpp.h>
 
@@ -84,21 +83,7 @@ inline __device__ void G4HepEmRandomEngine::flatArray(const int size, double *ve
 }
 #endif
 
-// A data structure to manage slots in the track storage.
-class SlotManager {
-  adept::Atomic_t<int> fNextSlot;
-  const int fMaxSlot;
-
-public:
-  __host__ __device__ SlotManager(int maxSlot) : fMaxSlot(maxSlot) { fNextSlot = 0; }
-
-  __host__ __device__ int NextSlot()
-  {
-    int next = fNextSlot.fetch_add(1);
-    if (next >= fMaxSlot) return -1;
-    return next;
-  }
-};
+using ParticleCount = unsigned int;
 
 using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
 // using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
@@ -121,25 +106,18 @@ using BlobType = std::byte *;
 using View     = llama::View<Mapping, BlobType>;
 
 // A bundle of pointers to generate particles of an implicit type.
-class ParticleGenerator {
+struct ParticleGenerator {
   View fTracks;
-  SlotManager *fSlotManager;
-  adept::MParray *fActiveQueue;
+  ParticleCount *fNextSlot;
+  ParticleCount fMaxSlot;
 
-public:
-  __host__ __device__ ParticleGenerator(View tracks, SlotManager *slotManager, adept::MParray *activeQueue)
-      : fTracks(tracks), fSlotManager(slotManager), fActiveQueue(activeQueue)
+  __device__ decltype(auto) NextTrack()
   {
-  }
-
-  __host__ __device__ decltype(auto) NextTrack()
-  {
-    int slot = fSlotManager->NextSlot();
-    if (slot == -1) {
+    const auto next = atomicAdd(fNextSlot, ParticleCount{1});
+    if (next >= fMaxSlot) {
       COPCORE_EXCEPTION("No slot available in ParticleGenerator::NextTrack");
     }
-    fActiveQueue->push_back(slot);
-    return fTracks[slot];
+    return fTracks[next];
   }
 };
 
@@ -151,37 +129,37 @@ struct Secondaries {
 };
 
 // Kernels in different TUs.
-__global__ void TransportElectrons(View electrons, const adept::MParray *active, Secondaries secondaries,
-                                   adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void TransportPositrons(View positrons, const adept::MParray *active, Secondaries secondaries,
-                                   adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                   ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void TransportElectrons(View electrons, const ParticleCount *electronsCount, Secondaries secondaries,
+                                   GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                   SOAData const soaData);
+__global__ void TransportPositrons(View positrons, const ParticleCount *electronsCount, Secondaries secondaries,
+                                   GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                   SOAData const soaData);
 
-__global__ void TransportGammas(View gammas, const adept::MParray *active, Secondaries secondaries,
-                                adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void TransportGammas(View gammas, const ParticleCount *gammasCount, Secondaries secondaries,
+                                GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                SOAData const soaData);
 
 /// Run an interaction on the particles in soaData whose `nextInteraction` matches the ProcessIndex.
 /// The specific interaction that's run is defined by `interactionFunction`.
 template <int ProcessIndex, typename Func, typename... Args>
-__device__ void InteractionLoop(Func interactionFunction, adept::MParray const *active, SOAData const soaData,
+__device__ void InteractionLoop(Func interactionFunction, const ParticleCount *count, SOAData const soaData,
                                 Args &&...args)
 {
   constexpr unsigned int sharedSize = 8192;
   __shared__ int candidates[sharedSize];
   __shared__ unsigned int counter;
   __shared__ int threadsRunning;
-  counter        = 0;
-  threadsRunning = 0;
-
+  counter               = 0;
+  threadsRunning        = 0;
+  const auto activeSize = *count;
 #ifndef NDEBUG
   __shared__ unsigned int todoCounter;
   __shared__ unsigned int particlesDone;
   todoCounter   = 0;
   particlesDone = 0;
   __syncthreads();
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < active->size(); i += blockDim.x * gridDim.x) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const auto winnerProcess = soaData.nextInteraction[i];
     if (winnerProcess == ProcessIndex) atomicAdd(&todoCounter, 1);
   }
@@ -189,9 +167,8 @@ __device__ void InteractionLoop(Func interactionFunction, adept::MParray const *
 
   __syncthreads();
 
-  const auto activeSize = active->size();
-  int i                 = blockIdx.x * blockDim.x + threadIdx.x;
-  bool done             = false;
+  int i     = blockIdx.x * blockDim.x + threadIdx.x;
+  bool done = false;
   do {
     while (i < activeSize && counter < sharedSize - blockDim.x) {
       if (soaData.nextInteraction[i] == ProcessIndex) {
@@ -217,9 +194,8 @@ __device__ void InteractionLoop(Func interactionFunction, adept::MParray const *
 #endif
 
     for (int j = threadIdx.x; j < counter; j += blockDim.x) {
-      const auto soaSlot    = candidates[j];
-      const auto globalSlot = (*active)[soaSlot];
-      interactionFunction(globalSlot, soaData, soaSlot, std::forward<Args>(args)...);
+      const auto soaSlot = candidates[j];
+      interactionFunction(soaSlot, soaData, std::forward<Args>(args)...);
     }
 
     __syncthreads();
@@ -231,32 +207,29 @@ __device__ void InteractionLoop(Func interactionFunction, adept::MParray const *
   assert(particlesDone == todoCounter);
 }
 
-__global__ void IonizationEl(View particles, const adept::MParray *active, Secondaries secondaries,
-                             adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                             ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void BremsstrahlungEl(View particles, const adept::MParray *active, Secondaries secondaries,
-                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                 ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void IonizationEl(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                             GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void BremsstrahlungEl(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                 GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                 SOAData const soaData);
 
-__global__ void IonizationPos(View particles, const adept::MParray *active, Secondaries secondaries,
-                              adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                              ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void BremsstrahlungPos(View particles, const adept::MParray *active, Secondaries secondaries,
-                                  adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                  ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void AnnihilationPos(View particles, const adept::MParray *active, Secondaries secondaries,
-                                adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void IonizationPos(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                              GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void BremsstrahlungPos(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                  GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                  SOAData const soaData);
+__global__ void AnnihilationPos(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                SOAData const soaData);
 
-__global__ void PairCreation(View particles, const adept::MParray *active, Secondaries secondaries,
-                             adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                             ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void ComptonScattering(View particles, const adept::MParray *active, Secondaries secondaries,
-                                  adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                  ScoringPerVolume *scoringPerVolume, SOAData const soaData);
-__global__ void PhotoelectricEffect(View particles, const adept::MParray *active, Secondaries secondaries,
-                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                    ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void PairCreation(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                             GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData);
+__global__ void ComptonScattering(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                  GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                  SOAData const soaData);
+__global__ void PhotoelectricEffect(View particles, const ParticleCount *electronsCount, Secondaries secondaries,
+                                    GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                    SOAData const soaData);
 
 // Constant data structures from G4HepEm accessed by the kernels.
 // (defined in TestEm3.cu)

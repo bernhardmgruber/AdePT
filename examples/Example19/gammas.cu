@@ -19,19 +19,17 @@
 #include <G4HepEmGammaInteractionConversion.icc>
 #include <G4HepEmGammaInteractionPhotoelectric.icc>
 
-__global__ void TransportGammas(View gammas, const adept::MParray *active, Secondaries secondaries,
-                                adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void TransportGammas(View gammas, const ParticleCount *gammasCount, Secondaries secondaries,
+                                GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
 #ifdef VECGEOM_FLOAT_PRECISION
   const Precision kPush = 10 * vecgeom::kTolerance;
 #else
   const Precision kPush = 0.;
 #endif
-  int activeSize = active->size();
+  int activeSize = *gammasCount;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
-    const int slot      = (*active)[i];
-    auto &&currentTrack = gammas[slot];
+    auto &&currentTrack = gammas[i];
     const auto energy   = currentTrack(Energy{});
     auto pos            = currentTrack(Pos{});
     const auto dir      = currentTrack(Dir{});
@@ -43,9 +41,17 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     const int theMCIndex = MCIndex[lvolID];
 
     auto survive = [&](bool push = true) {
-      currentTrack(Pos{})      = pos;
-      currentTrack(NavState{}) = navState;
-      if (push) activeQueue->push_back(slot);
+      auto writeBack = [&](auto &&track) {
+        track(Pos{})      = pos;
+        track(NavState{}) = navState;
+      };
+      if (push) {
+        // copy track to memory for next iteration
+        auto &&nextTrack = secondaries.gammas.NextTrack();
+        nextTrack        = currentTrack;
+        writeBack(nextTrack); // I hope the compiler eliminates the dead stores
+      } else
+        writeBack(currentTrack);
     };
 
     // Signal that this slot doesn't undergo an interaction (yet)
@@ -132,9 +138,8 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
 }
 
 template <int ProcessIndex>
-__device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, int const soaSlot, View particles,
-                                 Secondaries secondaries, adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                 ScoringPerVolume *scoringPerVolume)
+__device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, View particles, Secondaries secondaries,
+                                 GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume)
 {
   auto &&currentTrack = particles[globalSlot];
   const auto energy   = currentTrack(Energy{});
@@ -147,7 +152,11 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
   const int lvolID     = volume->GetLogicalVolume()->id();
   const int theMCIndex = MCIndex[lvolID];
 
-  auto survive = [&] { activeQueue->push_back(globalSlot); };
+  auto survive = [&] {
+    // copy track to memory for next iteration
+    auto &&nextTrack = secondaries.gammas.NextTrack();
+    nextTrack        = currentTrack;
+  };
 
   auto &rngState = currentTrack(RngState{});
   RanluxppDouble newRNG{rngState.Branch()};
@@ -259,24 +268,23 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
   }
 }
 
-__global__ void PairCreation(View particles, const adept::MParray *active, Secondaries secondaries,
-                             adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                             ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void PairCreation(View particles, const ParticleCount *gammasCount, Secondaries secondaries,
+                             GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume, SOAData const soaData)
 {
-  InteractionLoop<0>(&GammaInteraction<0>, active, soaData, particles, secondaries, activeQueue, globalScoring,
+  InteractionLoop<0>(&GammaInteraction<0>, gammasCount, soaData, particles, secondaries, globalScoring,
                      scoringPerVolume);
 }
-__global__ void ComptonScattering(View particles, const adept::MParray *active, Secondaries secondaries,
-                                  adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                  ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void ComptonScattering(View particles, const ParticleCount *gammasCount, Secondaries secondaries,
+                                  GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                  SOAData const soaData)
 {
-  InteractionLoop<1>(&GammaInteraction<1>, active, soaData, particles, secondaries, activeQueue, globalScoring,
+  InteractionLoop<1>(&GammaInteraction<1>, gammasCount, soaData, particles, secondaries, globalScoring,
                      scoringPerVolume);
 }
-__global__ void PhotoelectricEffect(View particles, const adept::MParray *active, Secondaries secondaries,
-                                    adept::MParray *activeQueue, GlobalScoring *globalScoring,
-                                    ScoringPerVolume *scoringPerVolume, SOAData const soaData)
+__global__ void PhotoelectricEffect(View particles, const ParticleCount *gammasCount, Secondaries secondaries,
+                                    GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume,
+                                    SOAData const soaData)
 {
-  InteractionLoop<2>(&GammaInteraction<2>, active, soaData, particles, secondaries, activeQueue, globalScoring,
+  InteractionLoop<2>(&GammaInteraction<2>, gammasCount, soaData, particles, secondaries, globalScoring,
                      scoringPerVolume);
 }
