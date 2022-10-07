@@ -51,10 +51,10 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int globalSlot = (*active)[i];
     auto &&currentTrack  = electrons[globalSlot];
-    auto energy          = currentTrack(Energy{});
-    auto pos             = currentTrack(Pos{});
-    auto dir             = currentTrack(Dir{});
-    auto navState        = currentTrack(NavState{});
+    auto energy          = decayCopy(currentTrack(Energy{}));
+    auto pos             = decayCopy(currentTrack(Pos{}));
+    auto dir             = decayCopy(currentTrack(Dir{}));
+    auto navState        = decayCopy(currentTrack(NavState{}));
     const auto volume    = navState.Top();
     const int volumeID   = volume->id();
     // the MCC vector is indexed by the logical volume id
@@ -254,13 +254,13 @@ static __device__ __forceinline__ void TransportElectrons(View electrons, const 
         newRNG.Advance();
         gamma1(RngState{}) = newRNG;
         gamma1(Energy{})   = copcore::units::kElectronMassC2;
-        gamma1(Dir{}).Set(sint * cosPhi, sint * sinPhi, cost);
+        gamma1(Dir{})      = Vec3(sint * cosPhi, sint * sinPhi, cost);
 
         InitAsSecondary(gamma2, pos, navState);
         // Reuse the RNG state of the dying track.
         gamma2(RngState{}) = rngState;
         gamma2(Energy{})   = copcore::units::kElectronMassC2;
-        gamma2(Dir{})      = -gamma1(Dir{});
+        gamma2(Dir{})      = -decayCopy(gamma1(Dir{}));
       }
       // Particles are killed by not enqueuing them into the new activeQueue.
       continue;
@@ -331,24 +331,25 @@ __device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaD
                                     GlobalScoring *globalScoring, ScoringPerVolume *scoringPerVolume)
 {
   auto &&currentTrack = particles[globalSlot];
-  auto energy         = currentTrack(Energy{});
-  const auto pos      = currentTrack(Pos{});
-  auto dir            = currentTrack(Dir{});
-  const auto navState = currentTrack(NavState{});
+  auto energy         = decayCopy(currentTrack(Energy{}));
+  const auto pos      = decayCopy(currentTrack(Pos{}));
+  auto dir            = decayCopy(currentTrack(Dir{}));
+  const auto navState = decayCopy(currentTrack(NavState{}));
   const auto volume   = navState.Top();
   // the MCC vector is indexed by the logical volume id
   const int lvolID     = volume->GetLogicalVolume()->id();
   const int theMCIndex = MCIndex[lvolID];
 
-  auto survive = [&] {
-    currentTrack(Energy{}) = energy;
-    currentTrack(Dir{})    = dir;
+  auto rngState = decayCopy(currentTrack(RngState{}));
+  auto survive  = [&] {
+    currentTrack(RngState{}) = rngState;
+    currentTrack(Energy{})   = energy;
+    currentTrack(Dir{})      = dir;
     activeQueue->push_back(globalSlot);
   };
 
   const double theElCut = g4HepEmData.fTheMatCutData->fMatCutData[theMCIndex].fSecElProdCutE;
 
-  auto &rngState = currentTrack(RngState{});
   RanluxppDouble newRNG{rngState.Branch()};
   G4HepEmRandomEngine rnge{&rngState};
 
@@ -367,7 +368,7 @@ __device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaD
     InitAsSecondary(secondary, pos, navState);
     secondary(RngState{}) = newRNG;
     secondary(Energy{})   = deltaEkin;
-    secondary(Dir{})      = {dirSecondary[0], dirSecondary[1], dirSecondary[2]};
+    secondary(Dir{})      = Vec3{dirSecondary[0], dirSecondary[1], dirSecondary[2]};
 
     energy -= deltaEkin;
     dir = {dirPrimary[0], dirPrimary[1], dirPrimary[2]};
@@ -391,7 +392,7 @@ __device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaD
     InitAsSecondary(gamma, pos, navState);
     gamma(RngState{}) = newRNG;
     gamma(Energy{})   = deltaEkin;
-    gamma(Dir{}).Set(dirSecondary[0], dirSecondary[1], dirSecondary[2]);
+    gamma(Dir{})      = Vec3(dirSecondary[0], dirSecondary[1], dirSecondary[2]);
 
     energy -= deltaEkin;
     dir = {dirPrimary[0], dirPrimary[1], dirPrimary[2]};
@@ -411,13 +412,13 @@ __device__ void ElectronInteraction(int const globalSlot, SOAData const & /*soaD
     InitAsSecondary(gamma1, pos, navState);
     gamma1(RngState{}) = newRNG;
     gamma1(Energy{})   = theGamma1Ekin;
-    gamma1(Dir{}).Set(theGamma1Dir[0], theGamma1Dir[1], theGamma1Dir[2]);
+    gamma1(Dir{})      = Vec3(theGamma1Dir[0], theGamma1Dir[1], theGamma1Dir[2]);
 
     InitAsSecondary(gamma2, pos, navState);
     // Reuse the RNG state of the dying track.
     gamma2(RngState{}) = rngState;
     gamma2(Energy{})   = theGamma2Ekin;
-    gamma2(Dir{}).Set(theGamma2Dir[0], theGamma2Dir[1], theGamma2Dir[2]);
+    gamma2(Dir{})      = Vec3(theGamma2Dir[0], theGamma2Dir[1], theGamma2Dir[2]);
 
     // The current track is killed by not enqueuing into the next activeQueue.
   }

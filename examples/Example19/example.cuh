@@ -18,6 +18,8 @@
 #include <VecGeom/base/Vector3D.h>
 #include <VecGeom/navigation/NavStateIndex.h>
 
+using Vec3 = vecgeom::Vector3D<vecgeom::Precision>;
+
 constexpr int ThreadsPerBlock = 256;
 
 struct RngState {};
@@ -100,13 +102,13 @@ public:
   }
 };
 
-using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
+// using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
 // using Mapping  = llama::mapping::PackedSingleBlobSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
 // using Mapping  = llama::mapping::AlignedSingleBlobSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
 // using Mapping  = llama::mapping::MultiBlobSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>;
 // using Mapping  = llama::mapping::AoSoA<llama::ArrayExtentsDynamic<std::size_t, 1>, Track, 16>; // try 16, 32, 64, etc.
-// using Mapping  = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>,
-// unsigned long long, true>;
+using Mapping = llama::mapping::Trace<llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>,
+                                      unsigned long long, true>;
 // using Mapping = llama::mapping::Heatmap<llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, Track>, 1,
 //                                        unsigned long long>;
 // using Mapping =
@@ -119,6 +121,18 @@ using Mapping = llama::mapping::AoS<llama::ArrayExtentsDynamic<std::size_t, 1>, 
 //                                        llama::sizeOf<Track>, unsigned long long>;
 using BlobType = std::byte *;
 using View     = llama::View<Mapping, BlobType>;
+
+template <typename T, std::enable_if_t<llama::isProxyReference<T>, int> = 0>
+__host__ __device__ auto decayCopy(T t) -> typename T::value_type
+{
+  return t;
+}
+
+template <typename T>
+__host__ __device__ auto decayCopy(T &t) -> T
+{
+  return t;
+}
 
 // A bundle of pointers to generate particles of an implicit type.
 class ParticleGenerator {

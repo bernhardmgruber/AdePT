@@ -19,6 +19,14 @@
 #include <G4HepEmGammaInteractionConversion.icc>
 #include <G4HepEmGammaInteractionPhotoelectric.icc>
 
+// adapted from boost::mp11
+template <template <typename...> typename L, typename... T, typename F>
+__device__ __forceinline__ constexpr void mpForEachInlined(L<T...>, F &&f)
+{
+  using A = int[sizeof...(T)];
+  (void)A{((void)f(T{}), 0)...};
+}
+
 __global__ void TransportGammas(View gammas, const adept::MParray *active, Secondaries secondaries,
                                 adept::MParray *activeQueue, GlobalScoring *globalScoring,
                                 ScoringPerVolume *scoringPerVolume, SOAData const soaData)
@@ -32,10 +40,10 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < activeSize; i += blockDim.x * gridDim.x) {
     const int slot      = (*active)[i];
     auto &&currentTrack = gammas[slot];
-    const auto energy   = currentTrack(Energy{});
-    auto pos            = currentTrack(Pos{});
-    const auto dir      = currentTrack(Dir{});
-    auto navState       = currentTrack(NavState{});
+    const auto energy   = decayCopy(currentTrack(Energy{}));
+    auto pos            = decayCopy(currentTrack(Pos{}));
+    const auto dir      = decayCopy(currentTrack(Dir{}));
+    auto navState       = decayCopy(currentTrack(NavState{}));
     const auto volume   = navState.Top();
     const int volumeID  = volume->id();
     // the MCC vector is indexed by the logical volume id
@@ -58,11 +66,14 @@ __global__ void TransportGammas(View gammas, const adept::MParray *active, Secon
     theTrack->SetMCIndex(theMCIndex);
 
     // Sample the `number-of-interaction-left` and put it into the track.
-    boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
+    // boost::mp11::mp_for_each<boost::mp11::mp_iota_c<3>>([&](auto ic) {
+    mpForEachInlined(boost::mp11::mp_iota_c<3>{}, [&](auto ic) {
       constexpr int ip = decltype(ic)::value;
       double numIALeft = currentTrack(NumIALeft{}, llama::RecordCoord<ip>{});
       if (numIALeft <= 0) {
-        numIALeft = -std::log(currentTrack(RngState{}).Rndm());
+        auto rngState            = decayCopy(currentTrack(RngState{}));
+        numIALeft                = -std::log(rngState.Rndm());
+        currentTrack(RngState{}) = rngState;
       }
       theTrack->SetNumIALeft(numIALeft, ip);
     });
@@ -137,19 +148,22 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
                                  ScoringPerVolume *scoringPerVolume)
 {
   auto &&currentTrack = particles[globalSlot];
-  const auto energy   = currentTrack(Energy{});
-  const auto pos      = currentTrack(Pos{});
-  const auto dir      = currentTrack(Dir{});
-  const auto navState = currentTrack(NavState{});
+  const auto energy   = decayCopy(currentTrack(Energy{}));
+  const auto pos      = decayCopy(currentTrack(Pos{}));
+  const auto dir      = decayCopy(currentTrack(Dir{}));
+  const auto navState = decayCopy(currentTrack(NavState{}));
   const auto volume   = navState.Top();
   const int volumeID  = volume->id();
   // the MCC vector is indexed by the logical volume id
   const int lvolID     = volume->GetLogicalVolume()->id();
   const int theMCIndex = MCIndex[lvolID];
 
-  auto survive = [&] { activeQueue->push_back(globalSlot); };
+  auto rngState = decayCopy(currentTrack(RngState{}));
+  auto survive  = [&] {
+    currentTrack(RngState{}) = rngState;
+    activeQueue->push_back(globalSlot);
+  };
 
-  auto &rngState = currentTrack(RngState{});
   RanluxppDouble newRNG{rngState.Branch()};
   G4HepEmRandomEngine rnge{&rngState};
 
@@ -178,13 +192,13 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
     InitAsSecondary(electron, pos, navState);
     electron(RngState{}) = newRNG;
     electron(Energy{})   = elKinEnergy;
-    electron(Dir{}).Set(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
+    electron(Dir{})      = Vec3(dirSecondaryEl[0], dirSecondaryEl[1], dirSecondaryEl[2]);
 
     InitAsSecondary(positron, pos, navState);
     // Reuse the RNG state of the dying track.
-    positron(RngState{}) = currentTrack(RngState{});
+    positron(RngState{}) = rngState;
     positron(Energy{})   = posKinEnergy;
-    positron(Dir{}).Set(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
+    positron(Dir{})      = Vec3(dirSecondaryPos[0], dirSecondaryPos[1], dirSecondaryPos[2]);
 
     // The current track is killed by not enqueuing into the next activeQueue.
   } else if constexpr (ProcessIndex == 1) {
@@ -250,7 +264,7 @@ __device__ void GammaInteraction(int const globalSlot, SOAData const &soaData, i
       InitAsSecondary(electron, pos, navState);
       electron(RngState{}) = newRNG;
       electron(Energy{})   = photoElecE;
-      electron(Dir{}).Set(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
+      electron(Dir{})      = Vec3(dirPhotoElec[0], dirPhotoElec[1], dirPhotoElec[2]);
     } else {
       edep = energy;
     }

@@ -113,7 +113,8 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numEvents; i += blockDim.x * gridDim.x) {
     auto &&track = generator.NextTrack();
 
-    track(RngState{}).SetSeed(startEvent + i);
+    RanluxppDouble rngState;
+    rngState.SetSeed(startEvent + i);
     track(Energy{})                             = energy;
     track(NumIALeft{}, llama::RecordCoord<0>{}) = -1.0;
     track(NumIALeft{}, llama::RecordCoord<1>{}) = -1.0;
@@ -127,16 +128,20 @@ __global__ void InitPrimaries(ParticleGenerator generator, int startEvent, int n
     if (gun.movingGun) {
       // Generate particles flat in phi and in eta between -5 and 5. We'll lose the far forwards ones, so no need to
       // simulate.
-      const double phi = 2. * M_PI * track(RngState{}).Rndm();
-      const double eta = -5. + 10. * track(RngState{}).Rndm();
-      track(Dir{}).x() = static_cast<vecgeom::Precision>(cos(phi) / cosh(eta));
-      track(Dir{}).y() = static_cast<vecgeom::Precision>(sin(phi) / cosh(eta));
-      track(Dir{}).z() = static_cast<vecgeom::Precision>(tanh(eta));
+      const double phi = 2. * M_PI * rngState.Rndm();
+      const double eta = -5. + 10. * rngState.Rndm();
+      track(Dir{})     = {static_cast<vecgeom::Precision>(cos(phi) / cosh(eta)),
+                          static_cast<vecgeom::Precision>(sin(phi) / cosh(eta)),
+                          static_cast<vecgeom::Precision>(tanh(eta))};
     } else {
       track(Dir{}) = {gun.direction[0], gun.direction[1], gun.direction[2]};
     }
-    track(NavState{}).Clear();
-    BVHNavigator::LocatePointIn(world, track(Pos{}), track(NavState{}), true);
+    track(RngState{}) = rngState;
+
+    vecgeom::NavStateIndex navState;
+    navState.Clear();
+    BVHNavigator::LocatePointIn(world, track(Pos{}), navState, true);
+    track(NavState{}) = navState;
 
     atomicAdd(&globalScoring->numElectrons, 1);
   }
@@ -161,15 +166,37 @@ __global__ void ClearQueue(adept::MParray *queue)
   queue->clear();
 }
 
+constexpr bool printTable = true;
+
 template <typename View>
-void reportHits(View tracks, cudaStream_t stream)
+void reportHits(int iteration, std::string_view kernelName, View electrons, View positrons, View gammas)
 {
   if constexpr (llama::mapping::isTrace<typename View::Mapping>) {
-    std::byte *hitsArrayBlob = tracks.storageBlobs.back();
-    typename View::Mapping::FieldHitsArray hits;
-    COPCORE_CUDA_CHECK(cudaMemcpy(&hits, hitsArrayBlob, sizeof(hits), cudaMemcpyDeviceToHost));
-    tracks.mapping().printFieldHits(hits);
-    COPCORE_CUDA_CHECK(cudaMemsetAsync(hitsArrayBlob, 0, sizeof(hits), stream));
+    auto print = [&](View &view, std::string_view viewName) {
+      std::byte *hitsArrayBlob = view.storageBlobs.back();
+      typename View::Mapping::FieldHitsArray hits;
+      // TODO(bgruber): we can improve this by using cudaMemsetAsync and print inside cudaLaunchHostFunc
+      COPCORE_CUDA_CHECK(cudaMemcpy(&hits, hitsArrayBlob, sizeof(hits), cudaMemcpyDeviceToHost));
+
+      if constexpr (printTable) {
+        std::cout << iteration << " " << kernelName << " " << viewName;
+        using RecordDim = typename View::Mapping::RecordDim;
+        llama::forEachLeafCoord<RecordDim>([&](auto coord) {
+          const auto h = hits[llama::flatRecordCoord<RecordDim, decltype(coord)>];
+          std::cout << " " << h.reads << " " << h.writes;
+        });
+        std::cout << "\n";
+      } else {
+        std::cout << "Iteration " << iteration << ' ' << kernelName << ' ' << viewName << '\n';
+        view.mapping().printFieldHits(hits);
+        std::cout << '\n';
+      }
+
+      COPCORE_CUDA_CHECK(cudaMemset(hitsArrayBlob, 0, sizeof(hits)));
+    };
+    print(electrons, "electrons");
+    print(positrons, "positrons");
+    print(gammas, "gammas");
   }
 }
 
@@ -318,13 +345,26 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
   timer.Start();
   tracer.setTag("sim");
 
+  constexpr bool tracingTable = llama::mapping::isTrace<typename View::Mapping> && printTable;
+
   std::cout << std::endl << "Simulating particles ";
-  const bool detailed = (numParticles / batch) < 50;
+  const bool detailed = !tracingTable && (numParticles / batch) < 50;
   if (!detailed) {
     std::cout << "... " << std::flush;
   }
 
+  if constexpr (tracingTable) {
+    using RecordDim = typename View::Mapping::RecordDim;
+    std::cout << "\nIteration Kernel View";
+    llama::forEachLeafCoord<RecordDim>([](auto coord) {
+      auto name = llama::recordCoordTags<RecordDim>(coord);
+      std::cout << " " << name << "_R " << name << "_W";
+    });
+    std::cout << "\n";
+  }
+
   unsigned long long killed = 0;
+  int iteration             = 0;
   tracer.setTag("start event loop");
 
   for (int startEvent = 1; startEvent <= numParticles; startEvent += batch) {
@@ -375,6 +415,7 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         TransportElectrons<<<transportBlocks, ThreadsPerBlock, 0, electrons.stream>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
             scoringPerVolume, electrons.soaData);
+        reportHits(iteration, "TransportElectrons", electrons.tracks, positrons.tracks, gammas.tracks);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(electrons.event, electrons.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[0], electrons.event, 0));
@@ -382,9 +423,11 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         IonizationEl<<<32, ThreadsPerBlock, 0, interactionStreams[0]>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
             scoringPerVolume, electrons.soaData);
+        reportHits(iteration, "IonizationEl", electrons.tracks, positrons.tracks, gammas.tracks);
         BremsstrahlungEl<<<128, ThreadsPerBlock, 0, electrons.stream>>>(
             electrons.tracks, electrons.queues.currentlyActive, secondaries, electrons.queues.nextActive, globalScoring,
             scoringPerVolume, electrons.soaData);
+        reportHits(iteration, "BremsstrahlungEl", electrons.tracks, positrons.tracks, gammas.tracks);
 
         for (auto streamToWaitFor : {interactionStreams[0], electrons.stream}) {
           COPCORE_CUDA_CHECK(cudaEventRecord(electrons.event, streamToWaitFor));
@@ -401,6 +444,7 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         TransportPositrons<<<transportBlocks, ThreadsPerBlock, 0, positrons.stream>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume, positrons.soaData);
+        reportHits(iteration, "TransportPositrons", electrons.tracks, positrons.tracks, gammas.tracks);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(positrons.event, positrons.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(interactionStreams[1], positrons.event, 0));
@@ -409,12 +453,15 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         IonizationPos<<<32, ThreadsPerBlock, 0, interactionStreams[1]>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume, positrons.soaData);
+        reportHits(iteration, "IonizationPos", electrons.tracks, positrons.tracks, gammas.tracks);
         BremsstrahlungPos<<<128, ThreadsPerBlock, 0, positrons.stream>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume, positrons.soaData);
+        reportHits(iteration, "BremsstrahlungPos", electrons.tracks, positrons.tracks, gammas.tracks);
         AnnihilationPos<<<8, ThreadsPerBlock, 0, interactionStreams[2]>>>(
             positrons.tracks, positrons.queues.currentlyActive, secondaries, positrons.queues.nextActive, globalScoring,
             scoringPerVolume, positrons.soaData);
+        reportHits(iteration, "AnnihilationPos", electrons.tracks, positrons.tracks, gammas.tracks);
 
         for (auto streamToWaitFor : {interactionStreams[1], positrons.stream, interactionStreams[2]}) {
           COPCORE_CUDA_CHECK(cudaEventRecord(positrons.event, streamToWaitFor));
@@ -431,6 +478,7 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         TransportGammas<<<transportBlocks, ThreadsPerBlock, 0, gammas.stream>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume, gammas.soaData);
+        reportHits(iteration, "TransportGammas", electrons.tracks, positrons.tracks, gammas.tracks);
 
         COPCORE_CUDA_CHECK(cudaEventRecord(gammas.event, gammas.stream));
         COPCORE_CUDA_CHECK(cudaStreamWaitEvent(stream, gammas.event, 0));
@@ -442,14 +490,17 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         PairCreation<<<16, ThreadsPerBlock, 0, interactionStreams[0]>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume, gammas.soaData);
+        reportHits(iteration, "PairCreation", electrons.tracks, positrons.tracks, gammas.tracks);
         // About 10% of all gammas:
         ComptonScattering<<<64, ThreadsPerBlock, 0, interactionStreams[1]>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume, gammas.soaData);
+        reportHits(iteration, "ComptonScattering", electrons.tracks, positrons.tracks, gammas.tracks);
         // About 15% of all gammas:
         PhotoelectricEffect<<<64, ThreadsPerBlock, 0, interactionStreams[2]>>>(
             gammas.tracks, gammas.queues.currentlyActive, secondaries, gammas.queues.nextActive, globalScoring,
             scoringPerVolume, gammas.soaData);
+        reportHits(iteration, "PhotoelectricEffect", electrons.tracks, positrons.tracks, gammas.tracks);
         for (auto i = 0; i < 3; ++i) {
           COPCORE_CUDA_CHECK(cudaEventRecord(positrons.event, interactionStreams[i]));
           COPCORE_CUDA_CHECK(cudaStreamWaitEvent(stream, positrons.event, 0));
@@ -496,6 +547,7 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
         loopingNo         = 0;
       }
 
+      iteration++;
     } while (inFlight > 0 && loopingNo < 200);
 
     if (inFlight > 0) {
