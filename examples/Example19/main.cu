@@ -176,8 +176,8 @@ void runGPU(int numParticles, double energy, int batch, const int *MCIndex_host,
   cudaGetDeviceProperties(&deviceProp, 0);
 
   // Capacity of the different containers aka the maximum number of particles.
-  // Use 1/5 of GPU memory for each of e+/e-/gammas, leaving 2/5 for the rest.
-  const size_t Capacity = (deviceProp.totalGlobalMem / sizeof(Track) / 5);
+  // Use 26% of GPU memory for each of e+/e-/gammas, leaving 22% for the rest.
+  const size_t Capacity = (deviceProp.totalGlobalMem / sizeof(Track)) * 26 / 100;
 
   std::cout << "INFO: capacity of containers set to " << Capacity << std::endl;
   if (batch == -1) {
